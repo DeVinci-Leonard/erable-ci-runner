@@ -1,0 +1,105 @@
+name: Validation Multiplateforme Matériel Érable
+
+on:
+  repository_dispatch:
+    types: [validate-package]
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "Nom du paquet"
+        required: true
+        default: "jq"
+      targets_toml:
+        description: "Contenu de targets.toml (optionnel si démo)"
+        required: false
+
+jobs:
+  validate:
+    name: ${{ matrix.os-name }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            os-name: linux
+            arch: x86_64
+          - os: windows-latest
+            os-name: windows
+            arch: x86_64
+          - os: macos-14
+            os-name: macos
+            arch: aarch64
+          - os: macos-13
+            os-name: macos
+            arch: x86_64
+
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Configuration de Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Préparation des Manifestes
+        shell: python
+        env:
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          INPUT_PKG_NAME: ${{ inputs.package_name }}
+          INPUT_TARGETS: ${{ inputs.targets_toml }}
+        run: |
+          import json, os, sys
+          from pathlib import Path
+
+          payload_str = os.environ.get("EVENT_PAYLOAD") or ""
+          payload = {}
+          if payload_str and payload_str != "null":
+              try:
+                  data = json.loads(payload_str)
+                  if isinstance(data, dict):
+                      payload = data
+              except Exception as e:
+                  print("Erreur parsing payload:", e)
+
+          pkg_name = payload.get("package_name") or os.environ.get("INPUT_PKG_NAME") or "jq"
+          print(f"=== Préparation de la recette pour : {pkg_name} ===")
+
+          parts_dir = Path("package_test/parts")
+          parts_dir.mkdir(parents=True, exist_ok=True)
+
+          targets_content = (payload.get("targets_toml") or os.environ.get("INPUT_TARGETS") or "").strip()
+          
+          # Recette officielle par défaut (jq 1.7.1) si aucune recette spécifique fournie
+          if not targets_content:
+              print("Utilisation de la recette officielle jq 1.7.1...")
+              targets_content = """[targets.x86_64-windows]
+          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.exe"
+          sha256 = "7451fbbf37feffb9bf262bd97c54f0da558c63f0748e64152dd87b0a07b6d6ab"
+          binaries = [ { source = "jq-windows-amd64.exe", alias = "jq" } ]
+
+          [targets.x86_64-linux]
+          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64"
+          sha256 = "5942c9b0934e510ee61eb3e30273f1b3fe2590df93933a93d7c58b81d19c8ff5"
+          binaries = [ { source = "jq-linux-amd64", alias = "jq" } ]
+
+          [targets.aarch64-macos]
+          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64"
+          sha256 = "0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a"
+          binaries = [ { source = "jq-macos-arm64", alias = "jq" } ]
+
+          [targets.x86_64-macos]
+          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-amd64"
+          sha256 = "4155822bbf5ea90f5c79cf254665975eb4274d426d0709770c21774de5407443"
+          binaries = [ { source = "jq-macos-amd64", alias = "jq" } ]
+          """
+
+          with open(parts_dir / "targets.toml", "w", encoding="utf-8") as f:
+              f.write(targets_content)
+          print("[+] targets.toml écrit avec succès dans", parts_dir)
+
+      - name: Validation du Binaire et du Cycle de Vie
+        shell: bash
+        run: |
+          python3 runner/validate.py package_test

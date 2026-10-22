@@ -1,0 +1,102 @@
+name: Multi-OS Trampoline Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche ou commit Git cible sur GitLab"
+        required: false
+        default: "main"
+  repository_dispatch:
+    types: [build-trampoline]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }} - ${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x86_64
+            target_name: windows-x86_64
+            is_windows: true
+          - os: ubuntu-latest
+            name: Linux x86_64
+            target_name: linux-x86_64
+            is_linux: true
+          - os: macos-14
+            name: macOS Universal (ARM64 & Intel)
+            target_name: macos
+            is_macos: true
+
+    steps:
+      - name: Identifier la référence Git
+        shell: bash
+        run: |
+          GIT_REF="${{ github.event.client_payload.ref || inputs.ref || 'main' }}"
+          echo "GIT_REF=$GIT_REF" >> $GITHUB_ENV
+          echo "Compilation du trampoline sur ${{ matrix.os }} pour la référence $GIT_REF"
+
+      - name: Cloner le dépôt source Érable Core
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$GIT_REF" https://gitlab.com/cortexa/native-application-ai/erable/core.git core
+
+      - name: Configuration de Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.is_macos && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - name: Exécuter les tests unitaires du trampoline
+        shell: bash
+        run: |
+          cd core/tools/trampoline
+          cargo test --verbose
+
+      - name: Compiler le trampoline optimisé (Linux)
+        if: ${{ matrix.is_linux }}
+        shell: bash
+        run: |
+          cd core/tools/trampoline
+          cargo build --release
+          mkdir -p ../../../dist
+          cp target/release/trampoline ../../../dist/trampoline-x86_64-linux
+
+      - name: Compiler le trampoline optimisé (Windows)
+        if: ${{ matrix.is_windows }}
+        shell: bash
+        run: |
+          cd core/tools/trampoline
+          cargo build --release
+          mkdir -p ../../../dist
+          cp target/release/trampoline.exe ../../../dist/trampoline.exe
+          cp target/release/trampoline.exe ../../../dist/trampoline-x86_64-windows.exe
+
+      - name: Compiler les binaires macOS (Apple Silicon + Intel x86_64)
+        if: ${{ matrix.is_macos }}
+        shell: bash
+        run: |
+          cd core/tools/trampoline
+          # 1. Apple Silicon ARM64 (Natif)
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p ../../../dist
+          cp target/aarch64-apple-darwin/release/trampoline ../../../dist/trampoline-aarch64-macos
+          
+          # 2. Intel x86_64 (Cross-compilation native macOS SDK)
+          cargo build --release --target x86_64-apple-darwin
+          cp target/x86_64-apple-darwin/release/trampoline ../../../dist/trampoline-x86_64-macos
+          
+          # 3. Binaire Universel macOS
+          lipo -create -output ../../../dist/trampoline-universal-macos \
+            target/aarch64-apple-darwin/release/trampoline \
+            target/x86_64-apple-darwin/release/trampoline
+
+      - name: Téléverser l'artefact compilé
+        uses: actions/upload-artifact@v4
+        with:
+          name: trampoline-${{ matrix.target_name }}
+          path: dist/*
+          retention-days: 7
