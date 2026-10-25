@@ -186,7 +186,8 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         raw_bins = selected_target_info.get("binaries") or []
         for b in raw_bins:
             b_src = b.get("source") if isinstance(b, dict) else str(b)
-            candidate = list(extract_dir.rglob(b_src)) or list(extract_dir.rglob(f"{b_src}.exe")) or list(extract_dir.rglob(f"{b_src}.ps1"))
+            matches = list(extract_dir.rglob(b_src)) + list(extract_dir.rglob(f"{b_src}.exe")) + list(extract_dir.rglob(f"{b_src}.ps1"))
+            candidate = [f for f in matches if f.is_file()]
             if candidate:
                 target_binary = candidate[0]
                 break
