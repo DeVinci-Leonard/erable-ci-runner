@@ -30,9 +30,6 @@ jobs:
           - os: macos-14
             os-name: macos
             arch: aarch64
-          - os: macos-13
-            os-name: macos
-            arch: x86_64
 
     steps:
       - name: Récupération du dépôt
