@@ -94,6 +94,36 @@ jobs:
             target/aarch64-apple-darwin/release/trampoline \
             target/x86_64-apple-darwin/release/trampoline
 
+      - name: Validation croisée du Trampoline avec le paquet multiplateforme jq
+        shell: bash
+        run: |
+          mkdir -p test_trampoline
+          cd test_trampoline
+          
+          # Téléchargement de jq 1.7.1 pour l'OS courant
+          if [[ "${{ matrix.is_windows }}" == "true" ]]; then
+            curl -sLo jq_target.exe https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.exe
+            cp ../dist/trampoline.exe ./jq.exe
+            echo "./jq_target.exe" > jq.exe.target
+            ./jq.exe --version
+          elif [[ "${{ matrix.is_linux }}" == "true" ]]; then
+            curl -sLo jq_target https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+            chmod +x jq_target
+            cp ../dist/trampoline-x86_64-linux ./jq
+            chmod +x jq
+            echo "./jq_target" > jq.target
+            ./jq --version
+          elif [[ "${{ matrix.is_macos }}" == "true" ]]; then
+            curl -sLo jq_target https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64
+            chmod +x jq_target
+            cp ../dist/trampoline-aarch64-macos ./jq
+            chmod +x jq
+            echo "./jq_target" > jq.target
+            ./jq --version
+          fi
+          echo "[+] Validation croisée du Trampoline avec jq réussie !"
+          cd ..
+
       - name: Téléverser l'artefact compilé
         uses: actions/upload-artifact@v4
         with:

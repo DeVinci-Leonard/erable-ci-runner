@@ -33,6 +33,8 @@ except ImportError:
 def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
     if not file_path.exists() or file_path.stat().st_size < 4:
         return False
+    if file_path.suffix.lower() in (".ps1", ".bat", ".cmd", ".nu"):
+        return True
     with open(file_path, "rb") as f:
         magic = f.read(4)
 
@@ -167,7 +169,11 @@ def run_test_for_current_os(package_dir: Path) -> bool:
 
         # 4. Localisation du binaire et vérification magic
         print("[3/4] Inspection des signatures binaires...")
-        binaries = list(extract_dir.rglob("*.exe")) if current_system == "windows" else [f for f in extract_dir.rglob("*") if f.is_file() and not f.name.endswith(('.txt', '.md', '.json', '.toml', '.pdf', '.png'))]
+        binaries = (
+            list(extract_dir.rglob("*.exe")) + list(extract_dir.rglob("*.ps1")) + list(extract_dir.rglob("*.bat")) + list(extract_dir.rglob("*.cmd"))
+            if current_system == "windows"
+            else [f for f in extract_dir.rglob("*") if f.is_file() and not f.name.endswith(('.txt', '.md', '.json', '.toml', '.pdf', '.png'))]
+        )
         if not binaries:
             binaries = [f for f in extract_dir.rglob("*") if f.is_file() and f.stat().st_size > 1024]
 
@@ -180,7 +186,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         raw_bins = selected_target_info.get("binaries") or []
         for b in raw_bins:
             b_src = b.get("source") if isinstance(b, dict) else str(b)
-            candidate = list(extract_dir.rglob(b_src)) or list(extract_dir.rglob(f"{b_src}.exe"))
+            candidate = list(extract_dir.rglob(b_src)) or list(extract_dir.rglob(f"{b_src}.exe")) or list(extract_dir.rglob(f"{b_src}.ps1"))
             if candidate:
                 target_binary = candidate[0]
                 break
@@ -198,13 +204,24 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             os.chmod(target_binary, 0o755)
 
         try:
-            p = subprocess.run([str(target_binary), "--version"], capture_output=True, text=True, timeout=15)
+            if target_binary.suffix.lower() == ".ps1":
+                p = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(target_binary), "--version"],
+                    capture_output=True, text=True, errors="replace", timeout=15
+                )
+                if p.returncode != 0 and "version" not in (p.stdout + p.stderr).lower():
+                    p = subprocess.run(
+                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(target_binary), "-h"],
+                        capture_output=True, text=True, errors="replace", timeout=15
+                    )
+            else:
+                p = subprocess.run([str(target_binary), "--version"], capture_output=True, text=True, errors="replace", timeout=15)
             if p.returncode == 0 or "version" in (p.stdout + p.stderr).lower():
                 print(f"  [+] SUCCÈS : Binaire exécuté avec succès !\n  -> Sortie : {p.stdout.strip()[:100]}")
                 return True
             else:
                 # Repli avec --help
-                p_help = subprocess.run([str(target_binary), "--help"], capture_output=True, text=True, timeout=15)
+                p_help = subprocess.run([str(target_binary), "--help"], capture_output=True, text=True, errors="replace", timeout=15)
                 if p_help.returncode in (0, 1):
                     print(f"  [+] SUCCÈS : Commande d'aide validée avec succès.")
                     return True
