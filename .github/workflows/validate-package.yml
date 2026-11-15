@@ -1,5 +1,7 @@
 name: Validation Multiplateforme Matériel Érable
 
+run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}-${{ github.event.client_payload.correlation_id || github.run_number }}"
+
 on:
   repository_dispatch:
     types: [validate-package]
@@ -12,24 +14,82 @@ on:
       targets_toml:
         description: "Contenu de targets.toml (optionnel si démo)"
         required: false
+      category:
+        description: "Catégorie du paquet (cli, gui, fonts)"
+        required: false
+        default: "cli"
 
 jobs:
+  prepare:
+    name: Planification Matrice OS
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_targets: ${{ steps.plan.outputs.has_targets }}
+      category: ${{ steps.plan.outputs.category }}
+    steps:
+      - name: Analyse des cibles déclarées
+        id: plan
+        shell: python
+        env:
+          EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          INPUT_TARGETS: ${{ inputs.targets_toml }}
+          INPUT_CATEGORY: ${{ inputs.category }}
+        run: |
+          import json, os, tomllib
+
+          payload_str = os.environ.get("EVENT_PAYLOAD") or ""
+          payload = {}
+          if payload_str and payload_str != "null":
+              try:
+                  parsed = json.loads(payload_str)
+                  if isinstance(parsed, dict):
+                      payload = parsed
+              except Exception:
+                  pass
+
+          category = str(payload.get("category") or os.environ.get("INPUT_CATEGORY") or "cli").strip().lower()
+          targets_content = (payload.get("targets_toml") or os.environ.get("INPUT_TARGETS") or "").strip()
+
+          if not targets_content:
+              os_families = {"linux", "windows", "macos"}
+          else:
+              try:
+                  tdata = tomllib.loads(targets_content).get("targets", {})
+              except Exception:
+                  tdata = {}
+              os_families = set()
+              for key in tdata.keys():
+                  kl = key.lower()
+                  if "linux" in kl:
+                      os_families.add("linux")
+                  elif "windows" in kl:
+                      os_families.add("windows")
+                  elif any(m in kl for m in ("macos", "darwin", "osx")):
+                      os_families.add("macos")
+
+          runner_specs = [
+              {"os": "ubuntu-latest", "os-name": "linux", "arch": "x86_64"},
+              {"os": "windows-latest", "os-name": "windows", "arch": "x86_64"},
+              {"os": "macos-latest", "os-name": "macos", "arch": "aarch64"},
+          ]
+          include = [spec for spec in runner_specs if spec["os-name"] in os_families]
+
+          gh_out = os.environ["GITHUB_OUTPUT"]
+          with open(gh_out, "a", encoding="utf-8") as fh:
+              fh.write(f"has_targets={'true' if include else 'false'}\n")
+              fh.write(f"category={category}\n")
+              fh.write(f"matrix={json.dumps({'include': include})}\n")
+          print(f"[plan] Catégorie={category} | Runners sélectionnés={[x['os-name'] for x in include]}")
+
   validate:
+    needs: prepare
+    if: needs.prepare.outputs.has_targets == 'true'
     name: ${{ matrix.os-name }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            os-name: linux
-            arch: x86_64
-          - os: windows-latest
-            os-name: windows
-            arch: x86_64
-          - os: macos-14
-            os-name: macos
-            arch: aarch64
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
 
     steps:
       - name: Récupération du dépôt
@@ -47,7 +107,7 @@ jobs:
           INPUT_PKG_NAME: ${{ inputs.package_name }}
           INPUT_TARGETS: ${{ inputs.targets_toml }}
         run: |
-          import json, os, sys
+          import json, os
           from pathlib import Path
 
           payload_str = os.environ.get("EVENT_PAYLOAD") or ""
@@ -67,8 +127,7 @@ jobs:
           parts_dir.mkdir(parents=True, exist_ok=True)
 
           targets_content = (payload.get("targets_toml") or os.environ.get("INPUT_TARGETS") or "").strip()
-          
-          # Recette officielle par défaut (jq 1.7.1) si aucune recette spécifique fournie
+
           if not targets_content:
               print("Utilisation de la recette officielle jq 1.7.1...")
               targets_content = """[targets.x86_64-windows]
@@ -98,5 +157,7 @@ jobs:
 
       - name: Validation du Binaire et du Cycle de Vie
         shell: bash
+        env:
+          PACKAGE_CATEGORY: ${{ needs.prepare.outputs.category }}
         run: |
           python3 runner/validate.py package_test
