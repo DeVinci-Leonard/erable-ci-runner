@@ -40,7 +40,7 @@ def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
 
     if (
         magic.startswith(b"\xef\xbb\xbf")
-        or magic.startswith(b"#!")
+        or (magic.startswith(b"#!") and expected_os != "windows")
         or magic.startswith(b"@echo")
         or magic.startswith(b"rem")
         or b"param(" in magic.lower()
@@ -54,12 +54,8 @@ def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
             return True
         if file_path.suffix.lower() in (".jar", ".msi", ".msix", ".appx") and magic[:2] in (b"PK", b"\xd0\xcf"):
             return True
-        if b"\x00" not in magic:
-            try:
-                magic.decode("utf-8")
-                return True
-            except UnicodeDecodeError:
-                pass
+        if file_path.suffix.lower() in (".bat", ".cmd", ".ps1"):
+            return True
         return False
     if expected_os in ("darwin", "macos"):
         mach_magics = (
@@ -164,18 +160,24 @@ def run_test_for_current_os(package_dir: Path) -> bool:
 
     selected_target_key: Optional[str] = None
     selected_target_info: Optional[Dict[str, Any]] = None
+    explicit_target_key = os.environ.get("TARGET_KEY", "").strip()
 
-    for target_key, info in targets_data.items():
-        key_lower = target_key.lower()
-        if os_key_pattern in key_lower or (os_key_pattern == "macos" and "darwin" in key_lower):
-            if ("arm64" in current_arch or "aarch64" in current_arch) and ("arm64" in key_lower or "aarch64" in key_lower):
-                selected_target_key = target_key
-                selected_target_info = info
-                break
-            if ("x86_64" in current_arch or "amd64" in current_arch) and ("x86_64" in key_lower or "amd64" in key_lower):
-                selected_target_key = target_key
-                selected_target_info = info
-                break
+    if explicit_target_key and explicit_target_key in targets_data:
+        selected_target_key = explicit_target_key
+        selected_target_info = targets_data[explicit_target_key]
+
+    if not selected_target_info:
+        for target_key, info in targets_data.items():
+            key_lower = target_key.lower()
+            if os_key_pattern in key_lower or (os_key_pattern == "macos" and "darwin" in key_lower):
+                if ("arm64" in current_arch or "aarch64" in current_arch) and ("arm64" in key_lower or "aarch64" in key_lower):
+                    selected_target_key = target_key
+                    selected_target_info = info
+                    break
+                if ("x86_64" in current_arch or "amd64" in current_arch) and ("x86_64" in key_lower or "amd64" in key_lower):
+                    selected_target_key = target_key
+                    selected_target_info = info
+                    break
 
     if not selected_target_info:
         for target_key, info in targets_data.items():
@@ -303,6 +305,9 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                 and verify_binary_magic(f, os_key_pattern)
             ]
             if matched:
+                if current_system == "windows":
+                    ext_prio = {".exe": 0, ".cmd": 1, ".bat": 2, ".ps1": 3}
+                    matched.sort(key=lambda p: (ext_prio.get(p.suffix.lower(), 4), len(p.parts)))
                 target_binary = matched[0]
                 break
 
@@ -328,11 +333,16 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
         print(f"  [+] Signature machine validée avec succès pour {os_key_pattern.upper()}.")
 
-        # 4. Applications GUI (catégorie, bundle .app ou sous-système PE Windows GUI == 2) : pas d'ouverture de fenêtre bloquante en headless
+        # 4. Applications GUI (catégorie, bundle .app ou sous-système PE Windows GUI == 2) ou architecture étrangère non émulée
         is_app_bundle = ".app/contents/macos/" in str(target_binary).replace("\\", "/").lower()
         is_pe_gui = current_system == "windows" and is_windows_gui_pe(target_binary)
-        if category == "gui" or is_app_bundle or is_pe_gui or target_binary.suffix.lower() in (".msi", ".jar"):
-            print("  [+] Application GUI / bundle certifié sans lancement de fenêtre headless bloquante.")
+        host_is_arm = "arm64" in current_arch or "aarch64" in current_arch
+        tgt_low = str(selected_target_key or "").lower()
+        tgt_is_arm = "arm64" in tgt_low or "aarch64" in tgt_low
+        tgt_is_x64 = "x86_64" in tgt_low or "amd64" in tgt_low
+        is_cross_isa = (host_is_arm and tgt_is_x64 and current_system != "darwin") or ((not host_is_arm) and tgt_is_arm)
+        if category == "gui" or is_app_bundle or is_pe_gui or is_cross_isa or target_binary.suffix.lower() in (".msi", ".jar"):
+            print("  [+] Application GUI / bundle / cible cross-ISA certifiée par SHA-256 et en-tête binaire.")
             return True
 
         # 5. Exécution réelle native par chemin absolu direct hors PATH (--version ou --help)
@@ -353,6 +363,22 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                 if p.returncode != 0 and "version" not in (p.stdout + p.stderr).lower():
                     p = subprocess.run(
                         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", direct_bin, "-h"],
+                        capture_output=True,
+                        text=True,
+                        errors="replace",
+                        timeout=15,
+                    )
+            elif target_binary.suffix.lower() in (".bat", ".cmd"):
+                p = subprocess.run(
+                    ["cmd.exe", "/d", "/e:off", "/c", direct_bin, "--version"],
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=15,
+                )
+                if p.returncode != 0 and "version" not in (p.stdout + p.stderr).lower():
+                    p = subprocess.run(
+                        ["cmd.exe", "/d", "/e:off", "/c", direct_bin, "-version"],
                         capture_output=True,
                         text=True,
                         errors="replace",
