@@ -14,6 +14,7 @@ import lzma
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -71,6 +72,29 @@ def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
         )
         return any(magic.startswith(m) for m in mach_magics) or magic.startswith(b"#!")
     return True
+
+
+def is_windows_gui_pe(file_path: Path) -> bool:
+    """Détecte de façon déterministe un binaire PE Windows à sous-système graphique (IMAGE_SUBSYSTEM_WINDOWS_GUI == 2)."""
+    if file_path.suffix.lower() not in (".exe", ""):
+        return False
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(4096)
+        if len(header) < 0x40 or header[:2] != b"MZ":
+            return False
+        pe_offset = int(struct.unpack_from("<I", header, 0x3C)[0])
+        if pe_offset < 0 or pe_offset + 24 + 70 > len(header):
+            return False
+        if header[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+            return False
+        opt_magic = int(struct.unpack_from("<H", header, pe_offset + 24)[0])
+        if opt_magic not in (0x10B, 0x20B):
+            return False
+        subsystem = int(struct.unpack_from("<H", header, pe_offset + 24 + 68)[0])
+        return subsystem == 2
+    except Exception:
+        return False
 
 
 def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
@@ -304,9 +328,10 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
         print(f"  [+] Signature machine validée avec succès pour {os_key_pattern.upper()}.")
 
-        # 4. Applications GUI ou bundles .app : pas d'ouverture de fenêtre graphique bloquante en headless
+        # 4. Applications GUI (catégorie, bundle .app ou sous-système PE Windows GUI == 2) : pas d'ouverture de fenêtre bloquante en headless
         is_app_bundle = ".app/contents/macos/" in str(target_binary).replace("\\", "/").lower()
-        if category == "gui" or is_app_bundle or target_binary.suffix.lower() in (".msi", ".jar"):
+        is_pe_gui = current_system == "windows" and is_windows_gui_pe(target_binary)
+        if category == "gui" or is_app_bundle or is_pe_gui or target_binary.suffix.lower() in (".msi", ".jar"):
             print("  [+] Application GUI / bundle certifié sans lancement de fenêtre headless bloquante.")
             return True
 
