@@ -14,15 +14,18 @@ import lzma
 import os
 import platform
 import shutil
+import signal
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import tomllib
 
@@ -134,6 +137,98 @@ def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
     return True
 
 
+_GUI_DESKTOP_BUNDLE_MARKERS = frozenset({
+    "chrome_100_percent.pak",
+    "chrome_200_percent.pak",
+    "resources.pak",
+    "webview2loader.dll",
+    "qt6gui.dll",
+    "qt5gui.dll",
+    "nw.dll",
+    "libcef.dll",
+    "libcef.so",
+    "electron.exe",
+})
+
+
+def has_desktop_gui_bundle_markers(extract_dir: Path) -> bool:
+    """Détecte de façon déterministe un bundle desktop (Electron/WebView2/Qt/CEF) sans relancer d'UI."""
+    for p in extract_dir.rglob("*"):
+        if p.is_file() and p.name.lower() in _GUI_DESKTOP_BUNDLE_MARKERS:
+            return True
+    return False
+
+
+def _build_probe_cmd(direct_bin: str, suffix: str, probe_args: List[str]) -> List[str]:
+    """Construit la commande d'exécution adaptée à l'extension du binaire (.ps1, .bat/.cmd ou natif)."""
+    low = suffix.lower()
+    if low == ".ps1":
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            direct_bin,
+            *probe_args,
+        ]
+    if low in (".bat", ".cmd"):
+        return ["cmd.exe", "/d", "/c", direct_bin, *probe_args]
+    return [direct_bin, *probe_args]
+
+
+def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, str]:
+    """Exécute un processus sans pipe bloquant hérité et tue tout l'arbre de processus sur timeout."""
+    fd_out, out_path = tempfile.mkstemp(prefix="erable-out-")
+    fd_err, err_path = tempfile.mkstemp(prefix="erable-err-")
+    proc: Optional[subprocess.Popen[bytes]] = None
+    try:
+        with os.fdopen(fd_out, "wb") as f_out, os.fdopen(fd_err, "wb") as f_err:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=f_out,
+                stderr=f_err,
+                creationflags=creationflags,
+                start_new_session=(os.name != "nt"),
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                else:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise
+        out_txt = Path(out_path).read_text(encoding="utf-8", errors="replace")
+        err_txt = Path(err_path).read_text(encoding="utf-8", errors="replace")
+        return proc.returncode, out_txt, err_txt
+    finally:
+        for tmp_f in (out_path, err_path):
+            try:
+                os.unlink(tmp_f)
+            except OSError:
+                pass
+
+
 def run_test_for_current_os(package_dir: Path) -> bool:
     current_system = platform.system().lower()
     current_arch = platform.machine().lower()
@@ -203,24 +298,41 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         "binaries" in selected_target_info and selected_target_info["binaries"] == []
     )
 
-    with tempfile.TemporaryDirectory(prefix="erable-gh-runner-") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="erable-gh-runner-", ignore_cleanup_errors=True) as tmp_dir:
         tmp_path = Path(tmp_dir)
         archive_file = tmp_path / "downloaded_file"
 
-        # 1. Téléchargement streamé + SHA-256 en passe unique (O(1) RAM, 1 seule lecture disque)
+        # 1. Téléchargement streamé + SHA-256 en passe unique avec retries sur 429/5xx transitoires
         print(f"[1/4] Téléchargement streamé depuis : {url}")
         is_sf = "sourceforge.net" in url.lower() or "sf.net" in url.lower()
         req_headers = {"User-Agent": "curl/8.4.0" if is_sf else ERABLE_USER_AGENT}
         if not is_sf:
             req_headers["Referer"] = ERABLE_REFERER
-        req = urllib.request.Request(url, headers=req_headers)
-        sha256 = hashlib.sha256()
-        with urllib.request.urlopen(req, timeout=180) as resp, open(archive_file, "wb") as f_out:
-            while chunk := resp.read(65536):
-                sha256.update(chunk)
-                f_out.write(chunk)
-
-        calc_hash = sha256.hexdigest().lower()
+        calc_hash = ""
+        for dl_attempt in range(3):
+            req = urllib.request.Request(url, headers=req_headers)
+            sha256 = hashlib.sha256()
+            try:
+                with urllib.request.urlopen(req, timeout=180) as resp, open(archive_file, "wb") as f_out:
+                    while chunk := resp.read(65536):
+                        sha256.update(chunk)
+                        f_out.write(chunk)
+                calc_hash = sha256.hexdigest().lower()
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and dl_attempt < 2:
+                    wait_s = 2 if dl_attempt == 0 else 5
+                    print(f"  [!] HTTP {e.code} transitoire sur {url}, nouvelle tentative dans {wait_s}s...")
+                    time.sleep(wait_s)
+                    continue
+                raise
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if dl_attempt < 2:
+                    wait_s = 2 if dl_attempt == 0 else 5
+                    print(f"  [!] Erreur réseau transitoire ({e}), nouvelle tentative dans {wait_s}s...")
+                    time.sleep(wait_s)
+                    continue
+                raise
         if calc_hash != expected_hash:
             print(f"[ERREUR] Divergence SHA-256 ! Attendu : {expected_hash}, Obtenu : {calc_hash}", file=sys.stderr)
             return False
@@ -333,70 +445,54 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
         print(f"  [+] Signature machine validée avec succès pour {os_key_pattern.upper()}.")
 
-        # 4. Applications GUI (catégorie, bundle .app ou sous-système PE Windows GUI == 2) ou architecture étrangère non émulée
+        # 4. Applications GUI (catégorie, bundle .app, marqueurs desktop ou PE GUI) ou cross-ISA non émulée
         is_app_bundle = ".app/contents/macos/" in str(target_binary).replace("\\", "/").lower()
         is_pe_gui = current_system == "windows" and is_windows_gui_pe(target_binary)
+        is_gui_bundle = has_desktop_gui_bundle_markers(extract_dir)
         host_is_arm = "arm64" in current_arch or "aarch64" in current_arch
         tgt_low = str(selected_target_key or "").lower()
         tgt_is_arm = "arm64" in tgt_low or "aarch64" in tgt_low
         tgt_is_x64 = "x86_64" in tgt_low or "amd64" in tgt_low
         is_cross_isa = (host_is_arm and tgt_is_x64 and current_system != "darwin") or ((not host_is_arm) and tgt_is_arm)
-        if category == "gui" or is_app_bundle or is_pe_gui or is_cross_isa or target_binary.suffix.lower() in (".msi", ".jar"):
+        if category == "gui" or is_app_bundle or is_pe_gui or is_gui_bundle or is_cross_isa or target_binary.suffix.lower() in (".msi", ".jar"):
             print("  [+] Application GUI / bundle / cible cross-ISA certifiée par SHA-256 et en-tête binaire.")
             return True
 
-        # 5. Exécution réelle native par chemin absolu direct hors PATH (--version ou --help)
+        # 5. Exécution réelle native par chemin absolu direct hors PATH (--version / -version / --help / -h / version)
         direct_bin = os.path.abspath(target_binary)
+        suffix = target_binary.suffix
         print(f"[4/4] Exécution native directe hors PATH : {direct_bin} --version...")
         if current_system != "windows":
             os.chmod(direct_bin, 0o755)
 
         try:
-            if target_binary.suffix.lower() == ".ps1":
-                p = subprocess.run(
-                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", direct_bin, "--version"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=15,
-                )
-                if p.returncode != 0 and "version" not in (p.stdout + p.stderr).lower():
-                    p = subprocess.run(
-                        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", direct_bin, "-h"],
-                        capture_output=True,
-                        text=True,
-                        errors="replace",
-                        timeout=15,
-                    )
-            elif target_binary.suffix.lower() in (".bat", ".cmd"):
-                p = subprocess.run(
-                    ["cmd.exe", "/d", "/e:off", "/c", direct_bin, "--version"],
-                    capture_output=True,
-                    text=True,
-                    errors="replace",
-                    timeout=15,
-                )
-                if p.returncode != 0 and "version" not in (p.stdout + p.stderr).lower():
-                    p = subprocess.run(
-                        ["cmd.exe", "/d", "/e:off", "/c", direct_bin, "-version"],
-                        capture_output=True,
-                        text=True,
-                        errors="replace",
-                        timeout=15,
-                    )
-            else:
-                p = subprocess.run([direct_bin, "--version"], capture_output=True, text=True, errors="replace", timeout=15)
+            last_rc = -1
+            last_err = ""
+            for probe_args, kind in (
+                (["--version"], "version"),
+                (["-version"], "version"),
+                (["--help"], "help"),
+                (["-h"], "help"),
+                (["version"], "subcmd_version"),
+            ):
+                cmd = _build_probe_cmd(direct_bin, suffix, probe_args)
+                rc, out_txt, err_txt = _run_bounded_command(cmd, timeout=45)
+                last_rc, last_err = rc, err_txt
+                combined = (out_txt + "\n" + err_txt).strip()
+                combined_low = combined.lower()
+                if "was unexpected at this time" in combined_low or "is not recognized" in combined_low:
+                    continue
+                if kind == "version" and (rc == 0 or "version" in combined_low):
+                    print(f"  [+] SUCCÈS : Binaire exécuté avec succès !\n  -> Sortie : {out_txt.strip()[:100]}")
+                    return True
+                if kind == "help" and rc in (0, 1) and combined != "":
+                    print(f"  [+] SUCCÈS : Commande d'aide ({' '.join(probe_args)}) validée avec succès.")
+                    return True
+                if kind == "subcmd_version" and rc == 0:
+                    print(f"  [+] SUCCÈS : Sous-commande 'version' validée !\n  -> Sortie : {out_txt.strip()[:100]}")
+                    return True
 
-            if p.returncode == 0 or "version" in (p.stdout + p.stderr).lower():
-                print(f"  [+] SUCCÈS : Binaire exécuté avec succès !\n  -> Sortie : {p.stdout.strip()[:100]}")
-                return True
-
-            p_help = subprocess.run([direct_bin, "--help"], capture_output=True, text=True, errors="replace", timeout=15)
-            if p_help.returncode in (0, 1):
-                print("  [+] SUCCÈS : Commande d'aide validée avec succès.")
-                return True
-
-            print(f"[ERREUR] Échec de l'exécution (code {p.returncode}) : {p.stderr.strip()}", file=sys.stderr)
+            print(f"[ERREUR] Échec de l'exécution (code {last_rc}) : {last_err.strip()}", file=sys.stderr)
             return False
         except Exception as e:
             print(f"[ERREUR] Exception lors de l'exécution native : {e}", file=sys.stderr)

@@ -1,6 +1,6 @@
 name: Validation Multiplateforme Matériel Érable
 
-run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}-${{ github.event.client_payload.correlation_id || github.run_number }}"
+run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}-${{ github.event.client_payload.correlation_id || inputs.correlation_id || github.run_number }}"
 
 on:
   repository_dispatch:
@@ -11,6 +11,10 @@ on:
         description: "Nom du paquet"
         required: true
         default: "jq"
+      version:
+        description: "Version du paquet"
+        required: false
+        default: "latest"
       targets_toml:
         description: "Contenu de targets.toml (optionnel si démo)"
         required: false
@@ -18,14 +22,21 @@ on:
         description: "Catégorie du paquet (cli, gui, fonts)"
         required: false
         default: "cli"
+      matrix:
+        description: "JSON matrix pré-calculée (optionnel)"
+        required: false
+      correlation_id:
+        description: "Identifiant de corrélation unique"
+        required: false
 
 jobs:
   validate:
     name: ${{ matrix.os-name }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(github.event.client_payload.matrix || '{"include":[{"os":"ubuntu-latest","os-name":"linux","arch":"x86_64","target_key":"x86_64-linux"},{"os":"windows-latest","os-name":"windows","arch":"x86_64","target_key":"x86_64-windows"},{"os":"macos-latest","os-name":"macos","arch":"aarch64","target_key":"aarch64-macos"}]}') }}
+      matrix: ${{ fromJson(github.event.client_payload.matrix || inputs.matrix || '{"include":[{"os":"ubuntu-latest","os-name":"linux","arch":"x86_64","target_key":"x86_64-linux"},{"os":"windows-latest","os-name":"windows","arch":"x86_64","target_key":"x86_64-windows"},{"os":"macos-latest","os-name":"macos","arch":"aarch64","target_key":"aarch64-macos"}]}') }}
 
     steps:
       - name: Récupération du dépôt
