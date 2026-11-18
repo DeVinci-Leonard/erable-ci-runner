@@ -9,6 +9,8 @@ Valide pour l'OS courant :
    ou certification d'en-tête natif pour les applications GUI/fonts sans serveur graphique.
 """
 
+from contextlib import contextmanager
+import gzip
 import hashlib
 import lzma
 import os
@@ -26,7 +28,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import tomllib
 
@@ -203,6 +205,8 @@ def _build_sanitized_probe_env() -> Dict[str, str]:
     env["CI"] = "true"
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
+    env["COLORFGBG"] = "15;0"
+    env["THEME_MODE"] = "dark"
     env["DO_NOT_TRACK"] = "1"
     env["DAGGER_NO_UPDATE_CHECK"] = "1"
     env["DAGGER_NO_NAG"] = "1"
@@ -250,7 +254,14 @@ def _run_bounded_command(
     eff_env = env if env is not None else _build_sanitized_probe_env()
     try:
         with os.fdopen(fd_out, "wb") as f_out, os.fdopen(fd_err, "wb") as f_err:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            creationflags = (
+                (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                )
+                if os.name == "nt"
+                else 0
+            )
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -263,14 +274,17 @@ def _run_bounded_command(
             )
             try:
                 proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                    )
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=10,
+                        )
+                    except (subprocess.SubprocessError, OSError):
+                        pass
                 else:
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
@@ -284,7 +298,9 @@ def _run_bounded_command(
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                raise
+                p_out = Path(out_path).read_bytes() if Path(out_path).exists() else b""
+                p_err = Path(err_path).read_bytes() if Path(err_path).exists() else b""
+                raise subprocess.TimeoutExpired(cmd, timeout, output=p_out, stderr=p_err) from exc
         out_txt = Path(out_path).read_text(encoding="utf-8", errors="replace")
         err_txt = Path(err_path).read_text(encoding="utf-8", errors="replace")
         return proc.returncode, out_txt, err_txt
@@ -292,6 +308,29 @@ def _run_bounded_command(
         for tmp_f in (out_path, err_path):
             try:
                 os.unlink(tmp_f)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _short_temp_dir(is_windows: bool) -> Iterator[str]:
+    """Crée un dossier temporaire court (<Drive>:\\er-t\\r-xxx) sur Windows anti-limite 8191 car."""
+    short_tmp_dir: Optional[str] = None
+    if is_windows:
+        drive = os.path.splitdrive(str(Path.cwd()))[0] or os.path.splitdrive(tempfile.gettempdir())[0] or "C:"
+        cand_root = Path(f"{drive}\\er-t")
+        try:
+            cand_root.mkdir(parents=True, exist_ok=True)
+            short_tmp_dir = str(cand_root)
+        except OSError:
+            short_tmp_dir = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="r-", dir=short_tmp_dir, ignore_cleanup_errors=True) as tmp_dir:
+            yield tmp_dir
+    finally:
+        if short_tmp_dir:
+            try:
+                Path(short_tmp_dir).rmdir()
             except OSError:
                 pass
 
@@ -365,7 +404,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         "binaries" in selected_target_info and selected_target_info["binaries"] == []
     )
 
-    with tempfile.TemporaryDirectory(prefix="erable-gh-runner-", ignore_cleanup_errors=True) as tmp_dir:
+    with _short_temp_dir(current_system == "windows") as tmp_dir:
         tmp_path = Path(tmp_dir)
         archive_file = tmp_path / "downloaded_file"
 
@@ -451,6 +490,19 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             raw_out = extract_dir / Path(clean_url_low[:-3]).name
             with lzma.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
+        elif clean_url_low.endswith(".gz") and not clean_url_low.endswith((".tar.gz", ".tgz")):
+            stem_name = Path(clean_url_low[:-3]).name or "binary"
+            if current_system == "windows" and not stem_name.lower().endswith((".exe", ".bat", ".cmd", ".ps1")):
+                stem_name += ".exe"
+            raw_out = extract_dir / stem_name
+            total_gz = 0
+            with gzip.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
+                while gz_chunk := f_in.read(65536):
+                    total_gz += len(gz_chunk)
+                    if total_gz > 512 * 1024 * 1024:
+                        print("[ERREUR] Flux .gz décompressé excessif (>512 Mo).", file=sys.stderr)
+                        return False
+                    f_out.write(gz_chunk)
         elif clean_url_low.endswith((".7z", ".msi")) and shutil.which("7z"):
             p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
             if p7z.returncode != 0:
@@ -554,7 +606,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             last_rc = -1
             last_err = ""
             for idx, (probe_args, kind) in enumerate(probes):
-                probe_timeout = 60 if idx == 0 else 20
+                probe_timeout = 25 if idx == 0 else 15
                 cmd = _build_probe_cmd(direct_bin, suffix, probe_args)
                 try:
                     rc, out_txt, err_txt = _run_bounded_command(
@@ -563,8 +615,15 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                         cwd=probe_cwd,
                         env=probe_env,
                     )
-                except subprocess.TimeoutExpired:
-                    print(f"  [!] Sonde {' '.join(probe_args)} expirée après {probe_timeout}s, passage à la sonde suivante...")
+                except subprocess.TimeoutExpired as exc:
+                    raw_out = exc.output or b""
+                    raw_err = exc.stderr or b""
+                    out_len = len(raw_out) if isinstance(raw_out, (bytes, str)) else 0
+                    err_len = len(raw_err) if isinstance(raw_err, (bytes, str)) else 0
+                    print(
+                        f"  [!] Sonde {' '.join(probe_args)} expirée après {probe_timeout}s "
+                        f"(out={out_len}o, err={err_len}o), passage à la sonde suivante..."
+                    )
                     last_rc = -1
                     last_err = f"Timeout ({probe_timeout}s) sur {' '.join(probe_args)}"
                     continue
