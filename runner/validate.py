@@ -13,6 +13,7 @@ import hashlib
 import lzma
 import os
 import platform
+import shlex
 import shutil
 import signal
 import struct
@@ -178,11 +179,75 @@ def _build_probe_cmd(direct_bin: str, suffix: str, probe_args: List[str]) -> Lis
     return [direct_bin, *probe_args]
 
 
-def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, str]:
+_PROBE_ENV_STRIP_KEYS = (
+    "DOCKER_HOST",
+    "CONTAINER_HOST",
+    "KUBECONFIG",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "ACTIONS_RUNTIME_TOKEN",
+    "ACTIONS_RESULTS_URL",
+    "ACTIONS_CACHE_URL",
+    "DAGGER_CLOUD_TOKEN",
+    "DAGGER_CLOUD_ENGINE",
+)
+_SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help"}
+
+
+def _build_sanitized_probe_env() -> Dict[str, str]:
+    """Assainit l'environnement des sondes CLI pour éviter connexions cloud/daemon ou télémétrie bloquante."""
+    env = dict(os.environ)
+    for key in _PROBE_ENV_STRIP_KEYS:
+        env.pop(key, None)
+    env["CI"] = "true"
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    env["DO_NOT_TRACK"] = "1"
+    env["DAGGER_NO_UPDATE_CHECK"] = "1"
+    env["DAGGER_NO_NAG"] = "1"
+    return env
+
+
+def _extract_safe_custom_probe(check_cmd: str, bin_stem: str) -> Optional[Tuple[List[str], str]]:
+    """Extrait une sonde simple sûre depuis CHECK_CMD (verification.toml) si compatible avec le binaire."""
+    raw = check_cmd.strip()
+    if not raw or any(ch in raw for ch in ("|", ";", "&", "$", "`", ">", "<", "\n", "\r", "(", ")")):
+        return None
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None
+    if len(tokens) < 2 or len(tokens) > 3:
+        return None
+    cmd_stem = Path(tokens[0]).stem.lower()
+    target_low = bin_stem.lower()
+    if not cmd_stem or (cmd_stem != target_low and not target_low.startswith(cmd_stem)):
+        return None
+    args = tokens[1:]
+    if not all(arg in _SAFE_CUSTOM_PROBE_ARGS for arg in args):
+        return None
+    first = args[0].lower()
+    if first == "version":
+        kind = "subcmd_version"
+    elif "help" in first or first == "-h":
+        kind = "help"
+    else:
+        kind = "version"
+    return args, kind
+
+
+def _run_bounded_command(
+    cmd: List[str],
+    timeout: int = 45,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str, str]:
     """Exécute un processus sans pipe bloquant hérité et tue tout l'arbre de processus sur timeout."""
     fd_out, out_path = tempfile.mkstemp(prefix="erable-out-")
     fd_err, err_path = tempfile.mkstemp(prefix="erable-err-")
     proc: Optional[subprocess.Popen[bytes]] = None
+    eff_env = env if env is not None else _build_sanitized_probe_env()
     try:
         with os.fdopen(fd_out, "wb") as f_out, os.fdopen(fd_err, "wb") as f_err:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
@@ -191,6 +256,8 @@ def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, s
                 stdin=subprocess.DEVNULL,
                 stdout=f_out,
                 stderr=f_err,
+                cwd=str(cwd) if cwd is not None else None,
+                env=eff_env,
                 creationflags=creationflags,
                 start_new_session=(os.name != "nt"),
             )
@@ -458,25 +525,49 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             print("  [+] Application GUI / bundle / cible cross-ISA certifiée par SHA-256 et en-tête binaire.")
             return True
 
-        # 5. Exécution réelle native par chemin absolu direct hors PATH (--version / -version / --help / -h / version)
+        # 5. Exécution réelle native par chemin absolu direct hors PATH (dossier isolé + tolérance scan à froid Defender)
         direct_bin = os.path.abspath(target_binary)
         suffix = target_binary.suffix
-        print(f"[4/4] Exécution native directe hors PATH : {direct_bin} --version...")
+        probe_cwd = tmp_path / "probe_cwd"
+        probe_cwd.mkdir(exist_ok=True)
+        probe_env = _build_sanitized_probe_env()
+
+        probes: List[Tuple[List[str], str]] = []
+        custom_probe = _extract_safe_custom_probe(os.environ.get("CHECK_CMD", ""), target_binary.stem)
+        if custom_probe is not None:
+            probes.append(custom_probe)
+        for default_probe in (
+            (["--version"], "version"),
+            (["version"], "subcmd_version"),
+            (["-version"], "version"),
+            (["--help"], "help"),
+            (["-h"], "help"),
+        ):
+            if default_probe not in probes:
+                probes.append(default_probe)
+
+        print(f"[4/4] Exécution native directe hors PATH : {direct_bin} {' '.join(probes[0][0])}...")
         if current_system != "windows":
             os.chmod(direct_bin, 0o755)
 
         try:
             last_rc = -1
             last_err = ""
-            for probe_args, kind in (
-                (["--version"], "version"),
-                (["-version"], "version"),
-                (["--help"], "help"),
-                (["-h"], "help"),
-                (["version"], "subcmd_version"),
-            ):
+            for idx, (probe_args, kind) in enumerate(probes):
+                probe_timeout = 60 if idx == 0 else 20
                 cmd = _build_probe_cmd(direct_bin, suffix, probe_args)
-                rc, out_txt, err_txt = _run_bounded_command(cmd, timeout=45)
+                try:
+                    rc, out_txt, err_txt = _run_bounded_command(
+                        cmd,
+                        timeout=probe_timeout,
+                        cwd=probe_cwd,
+                        env=probe_env,
+                    )
+                except subprocess.TimeoutExpired:
+                    print(f"  [!] Sonde {' '.join(probe_args)} expirée après {probe_timeout}s, passage à la sonde suivante...")
+                    last_rc = -1
+                    last_err = f"Timeout ({probe_timeout}s) sur {' '.join(probe_args)}"
+                    continue
                 last_rc, last_err = rc, err_txt
                 combined = (out_txt + "\n" + err_txt).strip()
                 combined_low = combined.lower()
@@ -489,7 +580,8 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                     print(f"  [+] SUCCÈS : Commande d'aide ({' '.join(probe_args)}) validée avec succès.")
                     return True
                 if kind == "subcmd_version" and rc == 0:
-                    print(f"  [+] SUCCÈS : Sous-commande 'version' validée !\n  -> Sortie : {out_txt.strip()[:100]}")
+                    preview = out_txt.strip()[:100] or err_txt.strip()[:100]
+                    print(f"  [+] SUCCÈS : Sous-commande 'version' validée !\n  -> Sortie : {preview}")
                     return True
 
             print(f"[ERREUR] Échec de l'exécution (code {last_rc}) : {last_err.strip()}", file=sys.stderr)
