@@ -15,6 +15,7 @@ import hashlib
 import lzma
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -31,6 +32,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import tomllib
+
+for _stream in (sys.stdout, sys.stderr):
+    getattr(_stream, "reconfigure", lambda **_kw: None)(encoding="utf-8", errors="replace")
 
 ERABLE_REFERER = "https://gitlab.com/cortexa/native-application-ai/erable"
 ERABLE_USER_AGENT = "Chrome/131.0.6778.86"
@@ -154,11 +158,29 @@ _GUI_DESKTOP_BUNDLE_MARKERS = frozenset({
 })
 
 
+_PS1_GUI_MARKERS = ("presentationframework", "system.windows.forms", "xamlreader", "-verb runas")
+
+
 def has_desktop_gui_bundle_markers(extract_dir: Path) -> bool:
-    """Détecte de façon déterministe un bundle desktop (Electron/WebView2/Qt/CEF) sans relancer d'UI."""
+    """Détecte de façon déterministe un bundle desktop, serveur Next.js (.next/BUILD_ID) ou script WPF .ps1."""
+    if (extract_dir / ".next" / "BUILD_ID").is_file():
+        return True
     for p in extract_dir.rglob("*"):
-        if p.is_file() and p.name.lower() in _GUI_DESKTOP_BUNDLE_MARKERS:
+        if not p.is_file():
+            continue
+        low_name = p.name.lower()
+        if low_name in _GUI_DESKTOP_BUNDLE_MARKERS:
             return True
+        if p.name == "BUILD_ID" and p.parent.name == ".next":
+            return True
+        if p.suffix.lower() == ".ps1" and p.stat().st_size < 5_000_000:
+            try:
+                with p.open("r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(262144).lower()
+                if any(marker in head for marker in _PS1_GUI_MARKERS):
+                    return True
+            except OSError:
+                pass
     return False
 
 
@@ -197,12 +219,31 @@ _PROBE_ENV_STRIP_KEYS = (
 _SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help"}
 
 
+def _promote_latest_jdk(env: Dict[str, str]) -> None:
+    """Sélectionne le JDK préinstallé >= 21 adapté à l'architecture hôte (ex. JAVA_HOME_25_X64)."""
+    arch_tags = ("ARM64", "AARCH64") if ("arm64" in platform.machine().lower() or "aarch64" in platform.machine().lower()) else ("X64", "AMD64")
+    best: Optional[Tuple[int, str]] = None
+    for key, val in env.items():
+        m = re.match(r"^JAVA_HOME_(\d+)_([A-Z0-9_]+)$", key)
+        if m and m.group(2) in arch_tags and val and Path(val).is_dir():
+            ver = int(m.group(1))
+            if ver >= 21 and (best is None or ver > best[0]):
+                best = (ver, val)
+    if best is not None:
+        env["JAVA_HOME"] = best[1]
+        bin_dir = str(Path(best[1]) / "bin")
+        cur_path = env.get("PATH", "")
+        env["PATH"] = f"{bin_dir}{os.pathsep}{cur_path}" if cur_path else bin_dir
+
+
 def _build_sanitized_probe_env() -> Dict[str, str]:
     """Assainit l'environnement des sondes CLI pour éviter connexions cloud/daemon ou télémétrie bloquante."""
     env = dict(os.environ)
     for key in _PROBE_ENV_STRIP_KEYS:
         env.pop(key, None)
+    _promote_latest_jdk(env)
     env["CI"] = "true"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
     env["COLORFGBG"] = "15;0"
@@ -254,14 +295,16 @@ def _run_bounded_command(
     eff_env = env if env is not None else _build_sanitized_probe_env()
     try:
         with os.fdopen(fd_out, "wb") as f_out, os.fdopen(fd_err, "wb") as f_err:
-            creationflags = (
-                (
-                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                    | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            if os.name == "nt":
+                launcher = Path(cmd[0]).stem.lower() if cmd else ""
+                win_flag = (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    if launcher in ("cmd", "powershell", "pwsh")
+                    else getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                 )
-                if os.name == "nt"
-                else 0
-            )
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | win_flag
+            else:
+                creationflags = 0
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
@@ -627,7 +670,10 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                     last_rc = -1
                     last_err = f"Timeout ({probe_timeout}s) sur {' '.join(probe_args)}"
                     continue
-                last_rc, last_err = rc, err_txt
+                last_rc = rc
+                diag = (err_txt.strip() or out_txt.strip())[:400]
+                if diag:
+                    last_err = diag
                 combined = (out_txt + "\n" + err_txt).strip()
                 combined_low = combined.lower()
                 if "was unexpected at this time" in combined_low or "is not recognized" in combined_low:
