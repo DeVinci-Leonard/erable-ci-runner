@@ -9,10 +9,14 @@ Valide pour l'OS courant :
    ou certification d'en-tête natif pour les applications GUI/fonts sans serveur graphique.
 """
 
+from contextlib import contextmanager
+import gzip
 import hashlib
 import lzma
 import os
 import platform
+import re
+import shlex
 import shutil
 import signal
 import struct
@@ -25,9 +29,12 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import tomllib
+
+for _stream in (sys.stdout, sys.stderr):
+    getattr(_stream, "reconfigure", lambda **_kw: None)(encoding="utf-8", errors="replace")
 
 ERABLE_REFERER = "https://gitlab.com/cortexa/native-application-ai/erable"
 ERABLE_USER_AGENT = "Chrome/131.0.6778.86"
@@ -151,11 +158,29 @@ _GUI_DESKTOP_BUNDLE_MARKERS = frozenset({
 })
 
 
+_PS1_GUI_MARKERS = ("presentationframework", "system.windows.forms", "xamlreader", "-verb runas")
+
+
 def has_desktop_gui_bundle_markers(extract_dir: Path) -> bool:
-    """Détecte de façon déterministe un bundle desktop (Electron/WebView2/Qt/CEF) sans relancer d'UI."""
+    """Détecte de façon déterministe un bundle desktop, serveur Next.js (.next/BUILD_ID) ou script WPF .ps1."""
+    if (extract_dir / ".next" / "BUILD_ID").is_file():
+        return True
     for p in extract_dir.rglob("*"):
-        if p.is_file() and p.name.lower() in _GUI_DESKTOP_BUNDLE_MARKERS:
+        if not p.is_file():
+            continue
+        low_name = p.name.lower()
+        if low_name in _GUI_DESKTOP_BUNDLE_MARKERS:
             return True
+        if p.name == "BUILD_ID" and p.parent.name == ".next":
+            return True
+        if p.suffix.lower() == ".ps1" and p.stat().st_size < 5_000_000:
+            try:
+                with p.open("r", encoding="utf-8", errors="ignore") as f:
+                    head = f.read(262144).lower()
+                if any(marker in head for marker in _PS1_GUI_MARKERS):
+                    return True
+            except OSError:
+                pass
     return False
 
 
@@ -178,32 +203,131 @@ def _build_probe_cmd(direct_bin: str, suffix: str, probe_args: List[str]) -> Lis
     return [direct_bin, *probe_args]
 
 
-def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, str]:
+_PROBE_ENV_STRIP_KEYS = (
+    "DOCKER_HOST",
+    "CONTAINER_HOST",
+    "KUBECONFIG",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "ACTIONS_RUNTIME_TOKEN",
+    "ACTIONS_RESULTS_URL",
+    "ACTIONS_CACHE_URL",
+    "DAGGER_CLOUD_TOKEN",
+    "DAGGER_CLOUD_ENGINE",
+)
+_SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help"}
+
+
+def _promote_latest_jdk(env: Dict[str, str]) -> None:
+    """Sélectionne le JDK préinstallé >= 21 adapté à l'architecture hôte (ex. JAVA_HOME_25_X64)."""
+    arch_tags = ("ARM64", "AARCH64") if ("arm64" in platform.machine().lower() or "aarch64" in platform.machine().lower()) else ("X64", "AMD64")
+    best: Optional[Tuple[int, str]] = None
+    for key, val in env.items():
+        m = re.match(r"^JAVA_HOME_(\d+)_([A-Z0-9_]+)$", key)
+        if m and m.group(2) in arch_tags and val and Path(val).is_dir():
+            ver = int(m.group(1))
+            if ver >= 21 and (best is None or ver > best[0]):
+                best = (ver, val)
+    if best is not None:
+        env["JAVA_HOME"] = best[1]
+        bin_dir = str(Path(best[1]) / "bin")
+        cur_path = env.get("PATH", "")
+        env["PATH"] = f"{bin_dir}{os.pathsep}{cur_path}" if cur_path else bin_dir
+
+
+def _build_sanitized_probe_env() -> Dict[str, str]:
+    """Assainit l'environnement des sondes CLI pour éviter connexions cloud/daemon ou télémétrie bloquante."""
+    env = dict(os.environ)
+    for key in _PROBE_ENV_STRIP_KEYS:
+        env.pop(key, None)
+    _promote_latest_jdk(env)
+    env["CI"] = "true"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    env["COLORFGBG"] = "15;0"
+    env["THEME_MODE"] = "dark"
+    env["DO_NOT_TRACK"] = "1"
+    env["DAGGER_NO_UPDATE_CHECK"] = "1"
+    env["DAGGER_NO_NAG"] = "1"
+    return env
+
+
+def _extract_safe_custom_probe(check_cmd: str, bin_stem: str) -> Optional[Tuple[List[str], str]]:
+    """Extrait une sonde simple sûre depuis CHECK_CMD (verification.toml) si compatible avec le binaire."""
+    raw = check_cmd.strip()
+    if not raw or any(ch in raw for ch in ("|", ";", "&", "$", "`", ">", "<", "\n", "\r", "(", ")")):
+        return None
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return None
+    if len(tokens) < 2 or len(tokens) > 3:
+        return None
+    cmd_stem = Path(tokens[0]).stem.lower()
+    target_low = bin_stem.lower()
+    if not cmd_stem or (cmd_stem != target_low and not target_low.startswith(cmd_stem)):
+        return None
+    args = tokens[1:]
+    if not all(arg in _SAFE_CUSTOM_PROBE_ARGS for arg in args):
+        return None
+    first = args[0].lower()
+    if first == "version":
+        kind = "subcmd_version"
+    elif "help" in first or first == "-h":
+        kind = "help"
+    else:
+        kind = "version"
+    return args, kind
+
+
+def _run_bounded_command(
+    cmd: List[str],
+    timeout: int = 45,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str, str]:
     """Exécute un processus sans pipe bloquant hérité et tue tout l'arbre de processus sur timeout."""
     fd_out, out_path = tempfile.mkstemp(prefix="erable-out-")
     fd_err, err_path = tempfile.mkstemp(prefix="erable-err-")
     proc: Optional[subprocess.Popen[bytes]] = None
+    eff_env = env if env is not None else _build_sanitized_probe_env()
     try:
         with os.fdopen(fd_out, "wb") as f_out, os.fdopen(fd_err, "wb") as f_err:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+            if os.name == "nt":
+                launcher = Path(cmd[0]).stem.lower() if cmd else ""
+                win_flag = (
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    if launcher in ("cmd", "powershell", "pwsh")
+                    else getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                )
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | win_flag
+            else:
+                creationflags = 0
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
                 stdout=f_out,
                 stderr=f_err,
+                cwd=str(cwd) if cwd is not None else None,
+                env=eff_env,
                 creationflags=creationflags,
                 start_new_session=(os.name != "nt"),
             )
             try:
                 proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 if os.name == "nt":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                    )
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=10,
+                        )
+                    except (subprocess.SubprocessError, OSError):
+                        pass
                 else:
                     try:
                         os.killpg(proc.pid, signal.SIGKILL)
@@ -217,7 +341,9 @@ def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, s
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                raise
+                p_out = Path(out_path).read_bytes() if Path(out_path).exists() else b""
+                p_err = Path(err_path).read_bytes() if Path(err_path).exists() else b""
+                raise subprocess.TimeoutExpired(cmd, timeout, output=p_out, stderr=p_err) from exc
         out_txt = Path(out_path).read_text(encoding="utf-8", errors="replace")
         err_txt = Path(err_path).read_text(encoding="utf-8", errors="replace")
         return proc.returncode, out_txt, err_txt
@@ -225,6 +351,29 @@ def _run_bounded_command(cmd: List[str], timeout: int = 45) -> Tuple[int, str, s
         for tmp_f in (out_path, err_path):
             try:
                 os.unlink(tmp_f)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _short_temp_dir(is_windows: bool) -> Iterator[str]:
+    """Crée un dossier temporaire court (<Drive>:\\er-t\\r-xxx) sur Windows anti-limite 8191 car."""
+    short_tmp_dir: Optional[str] = None
+    if is_windows:
+        drive = os.path.splitdrive(str(Path.cwd()))[0] or os.path.splitdrive(tempfile.gettempdir())[0] or "C:"
+        cand_root = Path(f"{drive}\\er-t")
+        try:
+            cand_root.mkdir(parents=True, exist_ok=True)
+            short_tmp_dir = str(cand_root)
+        except OSError:
+            short_tmp_dir = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="r-", dir=short_tmp_dir, ignore_cleanup_errors=True) as tmp_dir:
+            yield tmp_dir
+    finally:
+        if short_tmp_dir:
+            try:
+                Path(short_tmp_dir).rmdir()
             except OSError:
                 pass
 
@@ -298,7 +447,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         "binaries" in selected_target_info and selected_target_info["binaries"] == []
     )
 
-    with tempfile.TemporaryDirectory(prefix="erable-gh-runner-", ignore_cleanup_errors=True) as tmp_dir:
+    with _short_temp_dir(current_system == "windows") as tmp_dir:
         tmp_path = Path(tmp_dir)
         archive_file = tmp_path / "downloaded_file"
 
@@ -384,6 +533,19 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             raw_out = extract_dir / Path(clean_url_low[:-3]).name
             with lzma.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
+        elif clean_url_low.endswith(".gz") and not clean_url_low.endswith((".tar.gz", ".tgz")):
+            stem_name = Path(clean_url_low[:-3]).name or "binary"
+            if current_system == "windows" and not stem_name.lower().endswith((".exe", ".bat", ".cmd", ".ps1")):
+                stem_name += ".exe"
+            raw_out = extract_dir / stem_name
+            total_gz = 0
+            with gzip.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
+                while gz_chunk := f_in.read(65536):
+                    total_gz += len(gz_chunk)
+                    if total_gz > 512 * 1024 * 1024:
+                        print("[ERREUR] Flux .gz décompressé excessif (>512 Mo).", file=sys.stderr)
+                        return False
+                    f_out.write(gz_chunk)
         elif clean_url_low.endswith((".7z", ".msi")) and shutil.which("7z"):
             p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
             if p7z.returncode != 0:
@@ -458,26 +620,60 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             print("  [+] Application GUI / bundle / cible cross-ISA certifiée par SHA-256 et en-tête binaire.")
             return True
 
-        # 5. Exécution réelle native par chemin absolu direct hors PATH (--version / -version / --help / -h / version)
+        # 5. Exécution réelle native par chemin absolu direct hors PATH (dossier isolé + tolérance scan à froid Defender)
         direct_bin = os.path.abspath(target_binary)
         suffix = target_binary.suffix
-        print(f"[4/4] Exécution native directe hors PATH : {direct_bin} --version...")
+        probe_cwd = tmp_path / "probe_cwd"
+        probe_cwd.mkdir(exist_ok=True)
+        probe_env = _build_sanitized_probe_env()
+
+        probes: List[Tuple[List[str], str]] = []
+        custom_probe = _extract_safe_custom_probe(os.environ.get("CHECK_CMD", ""), target_binary.stem)
+        if custom_probe is not None:
+            probes.append(custom_probe)
+        for default_probe in (
+            (["--version"], "version"),
+            (["version"], "subcmd_version"),
+            (["-version"], "version"),
+            (["--help"], "help"),
+            (["-h"], "help"),
+        ):
+            if default_probe not in probes:
+                probes.append(default_probe)
+
+        print(f"[4/4] Exécution native directe hors PATH : {direct_bin} {' '.join(probes[0][0])}...")
         if current_system != "windows":
             os.chmod(direct_bin, 0o755)
 
         try:
             last_rc = -1
             last_err = ""
-            for probe_args, kind in (
-                (["--version"], "version"),
-                (["-version"], "version"),
-                (["--help"], "help"),
-                (["-h"], "help"),
-                (["version"], "subcmd_version"),
-            ):
+            for idx, (probe_args, kind) in enumerate(probes):
+                probe_timeout = 25 if idx == 0 else 15
                 cmd = _build_probe_cmd(direct_bin, suffix, probe_args)
-                rc, out_txt, err_txt = _run_bounded_command(cmd, timeout=45)
-                last_rc, last_err = rc, err_txt
+                try:
+                    rc, out_txt, err_txt = _run_bounded_command(
+                        cmd,
+                        timeout=probe_timeout,
+                        cwd=probe_cwd,
+                        env=probe_env,
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raw_out = exc.output or b""
+                    raw_err = exc.stderr or b""
+                    out_len = len(raw_out) if isinstance(raw_out, (bytes, str)) else 0
+                    err_len = len(raw_err) if isinstance(raw_err, (bytes, str)) else 0
+                    print(
+                        f"  [!] Sonde {' '.join(probe_args)} expirée après {probe_timeout}s "
+                        f"(out={out_len}o, err={err_len}o), passage à la sonde suivante..."
+                    )
+                    last_rc = -1
+                    last_err = f"Timeout ({probe_timeout}s) sur {' '.join(probe_args)}"
+                    continue
+                last_rc = rc
+                diag = (err_txt.strip() or out_txt.strip())[:400]
+                if diag:
+                    last_err = diag
                 combined = (out_txt + "\n" + err_txt).strip()
                 combined_low = combined.lower()
                 if "was unexpected at this time" in combined_low or "is not recognized" in combined_low:
@@ -489,7 +685,8 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                     print(f"  [+] SUCCÈS : Commande d'aide ({' '.join(probe_args)}) validée avec succès.")
                     return True
                 if kind == "subcmd_version" and rc == 0:
-                    print(f"  [+] SUCCÈS : Sous-commande 'version' validée !\n  -> Sortie : {out_txt.strip()[:100]}")
+                    preview = out_txt.strip()[:100] or err_txt.strip()[:100]
+                    print(f"  [+] SUCCÈS : Sous-commande 'version' validée !\n  -> Sortie : {preview}")
                     return True
 
             print(f"[ERREUR] Échec de l'exécution (code {last_rc}) : {last_err.strip()}", file=sys.stderr)

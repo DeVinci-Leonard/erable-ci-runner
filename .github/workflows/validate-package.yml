@@ -28,6 +28,9 @@ on:
       correlation_id:
         description: "Identifiant de corrélation unique"
         required: false
+      check_cmd:
+        description: "Commande de vérification optionnelle (verification.toml)"
+        required: false
 
 jobs:
   validate:
@@ -42,18 +45,51 @@ jobs:
       - name: Récupération du dépôt
         uses: actions/checkout@v7
 
-      - name: Configuration de Python 3.11
+      - name: Détection de Python >= 3.11
+        id: detect_py
+        shell: bash
+        run: |
+          PY_FOUND=""
+          for cand in python3 python /c/hostedtoolcache/windows/Python/*/*/python.exe /d/hostedtoolcache/windows/Python/*/*/python.exe "/c/Program Files"/Python3*/python.exe; do
+            if [ -x "$cand" ] || command -v "$cand" >/dev/null 2>&1; then
+              if "$cand" -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+                PY_FOUND="$cand"
+                break
+              fi
+            fi
+          done
+          if [ -n "$PY_FOUND" ]; then
+            echo "has_py=true" >> "$GITHUB_OUTPUT"
+            echo "PYTHON_BIN=$PY_FOUND" >> "$GITHUB_ENV"
+            echo "[+] Python >= 3.11 détecté nativement : $PY_FOUND ($("$PY_FOUND" --version))"
+          else
+            echo "has_py=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configuration de Python 3.12 (repli si absent)
+        if: steps.detect_py.outputs.has_py != 'true'
         uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
+
+      - name: Définition du binaire Python de repli
+        if: steps.detect_py.outputs.has_py != 'true'
+        shell: bash
+        run: |
+          if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
+            echo "PYTHON_BIN=python3" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON_BIN=python" >> "$GITHUB_ENV"
+          fi
 
       - name: Préparation des Manifestes
-        shell: python
+        shell: bash
         env:
           EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           INPUT_PKG_NAME: ${{ inputs.package_name }}
           INPUT_TARGETS: ${{ inputs.targets_toml }}
         run: |
+          "$PYTHON_BIN" - <<'PY'
           import json, os
           from pathlib import Path
 
@@ -101,11 +137,13 @@ jobs:
           with open(parts_dir / "targets.toml", "w", encoding="utf-8") as f:
               f.write(targets_content)
           print("[+] targets.toml écrit avec succès dans", parts_dir)
+          PY
 
       - name: Validation du Binaire et du Cycle de Vie
         shell: bash
         env:
           PACKAGE_CATEGORY: ${{ github.event.client_payload.category || inputs.category || 'cli' }}
           TARGET_KEY: ${{ matrix.target_key || '' }}
+          CHECK_CMD: ${{ github.event.client_payload.check_cmd || inputs.check_cmd || '' }}
         run: |
-          python3 runner/validate.py package_test
+          "$PYTHON_BIN" runner/validate.py package_test
