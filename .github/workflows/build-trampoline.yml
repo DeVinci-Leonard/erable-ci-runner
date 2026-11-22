@@ -1,0 +1,192 @@
+name: Multi-OS Trampoline Build (6 OS/Arch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branche ou commit Git cible sur GitLab"
+        required: false
+        default: "main"
+  repository_dispatch:
+    types: [build-trampoline]
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }} - ${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows x86_64
+            target_name: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
+            is_windows: true
+            ouch_asset: ouch-x86_64-pc-windows-msvc.zip
+          - os: windows-11-vs2026-arm
+            name: Windows ARM64
+            target_name: windows-aarch64
+            rust_target: aarch64-pc-windows-msvc
+            is_windows: true
+            ouch_asset: ouch-aarch64-pc-windows-msvc.zip
+          - os: ubuntu-latest
+            name: Linux x86_64
+            target_name: linux-x86_64
+            rust_target: x86_64-unknown-linux-musl
+            is_linux: true
+            ouch_asset: ouch-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-26.04-arm
+            name: Linux ARM64
+            target_name: linux-aarch64
+            rust_target: aarch64-unknown-linux-musl
+            is_linux: true
+            ouch_asset: ouch-aarch64-unknown-linux-gnu.tar.gz
+          - os: macos-latest
+            name: macOS Apple Silicon (ARM64)
+            target_name: macos-aarch64
+            rust_target: aarch64-apple-darwin
+            is_macos: true
+            ouch_asset: ouch-aarch64-apple-darwin.tar.gz
+          - os: macos-26-intel
+            name: macOS Intel (x86_64)
+            target_name: macos-x86_64
+            rust_target: x86_64-apple-darwin
+            is_macos: true
+            ouch_asset: ouch-x86_64-apple-darwin.tar.gz
+
+    steps:
+      - name: Identifier la référence Git
+        shell: bash
+        run: |
+          GIT_REF="${{ github.event.client_payload.ref || inputs.ref || 'main' }}"
+          echo "GIT_REF=$GIT_REF" >> "$GITHUB_ENV"
+          echo "Compilation du trampoline sur ${{ matrix.os }} (${{ matrix.target_name }}, target=${{ matrix.rust_target }}) pour la référence $GIT_REF"
+
+      - name: Cloner le dépôt source Érable Core
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$GIT_REF" https://gitlab.com/cortexa/native-application-ai/erable/core.git core
+
+      - name: Configuration de Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo Trampoline
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/tools/trampoline
+
+      - name: Outils musl statiques (Linux)
+        if: matrix.is_linux
+        shell: bash
+        run: |
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          fi
+
+      - name: Tests unitaires et compilation release du trampoline
+        shell: bash
+        run: |
+          cd core/tools/trampoline
+          cargo test --release --target "${{ matrix.rust_target }}" --verbose -- --test-threads=1
+          cargo build --release --target "${{ matrix.rust_target }}"
+          mkdir -p ../../../dist
+          REL_DIR="target/${{ matrix.rust_target }}/release"
+          case "${{ matrix.target_name }}" in
+            windows-x86_64)
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline.exe
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline-x86_64-windows.exe
+              ;;
+            windows-aarch64)
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline-aarch64-windows.exe
+              ;;
+            linux-x86_64)
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-x86_64-linux
+              file ../../../dist/trampoline-x86_64-linux
+              ;;
+            linux-aarch64)
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-aarch64-linux
+              file ../../../dist/trampoline-aarch64-linux
+              ;;
+            macos-aarch64)
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-aarch64-macos
+              ;;
+            macos-x86_64)
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-x86_64-macos
+              ;;
+          esac
+
+      - name: Validation croisée du Trampoline avec ouch (latest, natif 6 OS/Arch)
+        shell: bash
+        run: |
+          mkdir -p test_trampoline
+          cd test_trampoline
+          OUCH_EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/ouch-org/ouch/releases/latest)"
+          OUCH_TAG="${OUCH_EFFECTIVE_URL##*/}"
+          OUCH_ASSET="${{ matrix.ouch_asset }}"
+          OUCH_URL="https://github.com/ouch-org/ouch/releases/download/${OUCH_TAG}/${OUCH_ASSET}"
+          echo "[+] Téléchargement de $OUCH_URL..."
+          curl -fSL --retry 3 --retry-delay 2 "$OUCH_URL" -o "$OUCH_ASSET"
+          if [[ "$OUCH_ASSET" == *.zip ]]; then
+            python3 -m zipfile -e "$OUCH_ASSET" extracted 2>/dev/null || python -m zipfile -e "$OUCH_ASSET" extracted
+            OUCH_RAW="$(find extracted -name 'ouch.exe' -type f | head -n 1)"
+            cp "$OUCH_RAW" ./ouch_target.exe
+            if [ -f ../dist/trampoline-aarch64-windows.exe ]; then
+              cp ../dist/trampoline-aarch64-windows.exe ./ouch.exe
+            else
+              cp ../dist/trampoline-x86_64-windows.exe ./ouch.exe
+            fi
+            echo "./ouch_target.exe" > ouch.exe.target
+            ./ouch.exe --version
+          else
+            mkdir -p extracted
+            tar -xzf "$OUCH_ASSET" -C extracted
+            OUCH_RAW="$(find extracted -name 'ouch' -type f | head -n 1)"
+            cp "$OUCH_RAW" ./ouch_target
+            chmod +x ./ouch_target
+            SHIM_SRC="$(ls ../dist/trampoline-* | head -n 1)"
+            cp "$SHIM_SRC" ./ouch
+            chmod +x ./ouch
+            echo "./ouch_target" > ouch.target
+            ./ouch --version
+          fi
+          echo "[+] Validation croisée du Trampoline sur ${{ matrix.target_name }} avec ouch ($OUCH_TAG) réussie !"
+
+      - name: Téléverser l'artefact compilé
+        uses: actions/upload-artifact@v4
+        with:
+          name: trampoline-${{ matrix.target_name }}
+          path: dist/*
+          retention-days: 7
+
+  package-universal-macos:
+    name: Assemble macOS Universal Trampoline
+    needs: [build]
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Télécharger trampoline-macos-aarch64
+        uses: actions/download-artifact@v4
+        with:
+          name: trampoline-macos-aarch64
+          path: arm64
+      - name: Télécharger trampoline-macos-x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: trampoline-macos-x86_64
+          path: x86_64
+      - name: Assembler avec lipo
+        shell: bash
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/trampoline-universal-macos arm64/trampoline-aarch64-macos x86_64/trampoline-x86_64-macos
+          lipo -info dist/trampoline-universal-macos
+      - name: Téléverser trampoline-universal-macos
+        uses: actions/upload-artifact@v4
+        with:
+          name: trampoline-universal-macos
+          path: dist/*
+          retention-days: 7
