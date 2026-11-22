@@ -115,8 +115,101 @@ def is_windows_gui_pe(file_path: Path) -> bool:
         return False
 
 
+_UNCOMPRESS_TABLE: Dict[str, Dict[str, Any]] = {
+    "windows": {
+        "packages": ["ouch"],
+        "archive_bin": "ouch",
+        "msi_tool": "msiexec",
+        "dmg_tool": "ouch",
+    },
+    "linux": {
+        "packages": ["ouch"],
+        "archive_bin": "ouch",
+        "msi_tool": "7zz",
+        "dmg_tool": "ouch",
+    },
+    "macos": {
+        "packages": ["ouch"],
+        "archive_bin": "ouch",
+        "msi_tool": "7zz",
+        "dmg_tool": "hdiutil",
+    },
+}
+
+
+def _resolve_ouch_bin() -> Optional[str]:
+    """Résout l'exécutable ouch depuis OUCH_BIN, PATH ou ~/.erable/packages/ouch/current."""
+    env_ouch = os.environ.get("OUCH_BIN", "").strip()
+    if env_ouch and Path(env_ouch).is_file():
+        return env_ouch
+    is_win = platform.system().lower() == "windows"
+    for cand in (("ouch.exe", "ouch") if is_win else ("ouch",)):
+        found = shutil.which(cand)
+        if found:
+            return found
+    fallback = Path.home() / ".erable" / "packages" / "ouch" / "current" / ("ouch.exe" if is_win else "ouch")
+    if fallback.is_file():
+        return str(fallback)
+    return None
+
+
+def _check_zip_slip(archive_file: Path, extract_dir: Path) -> None:
+    extract_root_str = str(extract_dir.resolve())
+    with zipfile.ZipFile(archive_file, "r") as zf:
+        for m in zf.infolist():
+            target = (extract_dir / m.filename).resolve()
+            if not str(target).startswith(extract_root_str):
+                raise ValueError(f"Zip Slip détecté : {m.filename}")
+
+
+def _check_tar_slip(archive_file: Path, extract_dir: Path) -> List[tarfile.TarInfo]:
+    extract_root_str = str(extract_dir.resolve())
+    with tarfile.open(archive_file, "r:*") as tf:
+        members = tf.getmembers()
+        for t_member in members:
+            target = (extract_dir / t_member.name).resolve()
+            if not str(target).startswith(extract_root_str):
+                raise ValueError(f"Tar Slip détecté : {t_member.name}")
+            if t_member.issym() or t_member.islnk():
+                norm_link = os.path.normpath(os.path.join(os.path.dirname(t_member.name), t_member.linkname))
+                if not str((extract_dir / norm_link).resolve()).startswith(extract_root_str):
+                    raise ValueError(f"Lien symbolique hors arborescence : {t_member.name}")
+    return members
+
+
+def _resolve_named_archive_path(
+    archive_file: Path,
+    cache_dir: Path,
+    clean_url_low: str,
+    archive_type: str,
+) -> Path:
+    """Donne un nom avec extension reconnue par ouch dans cache_dir."""
+    base_name = Path(clean_url_low).name or "archive"
+    if "." not in base_name and archive_type and archive_type != "raw":
+        base_name = f"{base_name}.{archive_type.lstrip('.')}"
+    named_arc = cache_dir / base_name
+    if archive_file.resolve() != named_arc.resolve() and not named_arc.exists():
+        shutil.copy2(archive_file, named_arc)
+    return named_arc
+
+
+def _normalize_win_single_binary(extract_dir: Path, stem_fallback: str) -> None:
+    """Sous Windows, ajoute .exe si une décompression .gz/.xz produit un binaire PE sans extension."""
+    files = [f for f in extract_dir.rglob("*") if f.is_file()]
+    if len(files) == 1:
+        single = files[0]
+        if not single.suffix:
+            try:
+                head = single.read_bytes()[:2]
+            except OSError:
+                head = b""
+            if head == b"MZ":
+                target_exe = single.with_name((single.name or stem_fallback) + ".exe")
+                single.rename(target_exe)
+
+
 def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
-    """Extrait un .dmg via hdiutil (macOS) ou 7z en espace utilisateur. Retourne True si déjà certifié sans binaire."""
+    """Extrait un .dmg selon la table uncompress : hdiutil (macOS), ouch puis repli 7z (Win/Linux)."""
     if platform.system().lower() == "darwin" and shutil.which("hdiutil"):
         mnt_dir = tmp_path / "dmg_mnt"
         mnt_dir.mkdir(parents=True, exist_ok=True)
@@ -147,9 +240,10 @@ def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
             if any(f.is_file() for f in extract_dir.rglob("*")):
                 return False
 
-    if shutil.which("ouch") and archive_file.stat().st_size < 200 * 1024 * 1024:
+    ouch_bin = _resolve_ouch_bin()
+    if ouch_bin and archive_file.stat().st_size < 200 * 1024 * 1024:
         p_ouch = subprocess.run(
-            ["ouch", "decompress", "--yes", "--dir", str(extract_dir), str(archive_file)],
+            [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(archive_file)],
             capture_output=True,
             text=True,
             timeout=120,
@@ -164,6 +258,130 @@ def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
 
     print("  [+] Archive .dmg certifiée par SHA-256.")
     return True
+
+
+def _uncompress_archive(
+    archive_file: Path,
+    extract_dir: Path,
+    cache_dir: Path,
+    tmp_path: Path,
+    clean_url_low: str,
+    current_system: str,
+    pkg_name: str,
+    archive_type: str = "",
+) -> Tuple[bool, bool]:
+    """Applique la même stratégie que engine/tasks.nu (`task-uncompress-archive`).
+
+    Retourne (ok, early_certified).
+    """
+    at_low = archive_type.strip().lower()
+    is_zip = zipfile.is_zipfile(archive_file)
+    is_tar = (not is_zip) and tarfile.is_tarfile(archive_file)
+
+    if is_zip:
+        _check_zip_slip(archive_file, extract_dir)
+    elif is_tar:
+        members = _check_tar_slip(archive_file, extract_dir)
+    else:
+        members = []
+
+    if at_low == "dmg" or clean_url_low.endswith(".dmg"):
+        named_dmg = _resolve_named_archive_path(archive_file, cache_dir, clean_url_low, "dmg")
+        return True, _extract_dmg(named_dmg, extract_dir, tmp_path)
+
+    if at_low == "msi" or clean_url_low.endswith(".msi"):
+        if current_system == "windows":
+            named_msi = _resolve_named_archive_path(archive_file, cache_dir, clean_url_low, "msi")
+            abs_msi = str(named_msi.resolve())
+            abs_dest = str(extract_dir.resolve()).rstrip("\\")
+            p_msi = subprocess.run(
+                ["msiexec", "/a", abs_msi, "/qn", f"TARGETDIR={abs_dest}"],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if p_msi.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
+                return True, False
+        if shutil.which("7z"):
+            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
+            if p7z.returncode == 0:
+                return True, False
+            print(f"[ERREUR] Extraction 7z du MSI échouée : {p7z.stderr.strip()}", file=sys.stderr)
+            return False, False
+        print("  [+] Installeur .msi certifié par SHA-256.")
+        return True, True
+
+    archive_exts = (".zip", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".tzst", ".tar", ".zst", ".gz", ".xz", ".rar")
+    archive_types = {"zip", "7z", "tar.gz", "tgz", "tar.xz", "tar.zst", "tzst", "tar", "zst", "gz", "xz", "rar"}
+    looks_archive = is_zip or is_tar or clean_url_low.endswith(archive_exts) or at_low in archive_types
+
+    if looks_archive:
+        ouch_bin = _resolve_ouch_bin()
+        if ouch_bin and pkg_name.lower() != "ouch":
+            named_arc = _resolve_named_archive_path(archive_file, cache_dir, clean_url_low, at_low)
+            p_ouch = subprocess.run(
+                [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(named_arc)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
+                if current_system == "windows":
+                    _normalize_win_single_binary(extract_dir, Path(clean_url_low).stem or pkg_name)
+                return True, False
+            if p_ouch.returncode != 0:
+                print(f"  [i] Extraction ouch non applicable ({p_ouch.stderr.strip()[:120]}), repli natif...")
+
+        # Repli natif (bootstrap ouch ou format non pris en charge par ouch dans l'environnement)
+        if is_zip:
+            with zipfile.ZipFile(archive_file, "r") as zf:
+                try:
+                    zf.extractall(extract_dir)
+                    return True, False
+                except NotImplementedError:
+                    if shutil.which("7z"):
+                        subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=120)
+                        return True, False
+                    raise
+        if is_tar:
+            with tarfile.open(archive_file, "r:*") as tf:
+                tf.extractall(extract_dir, members=members)
+            return True, False
+        if clean_url_low.endswith(".xz") and not clean_url_low.endswith(".tar.xz"):
+            raw_out = extract_dir / Path(clean_url_low[:-3]).name
+            with lzma.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            if current_system == "windows":
+                _normalize_win_single_binary(extract_dir, raw_out.name)
+            return True, False
+        if clean_url_low.endswith(".gz") and not clean_url_low.endswith((".tar.gz", ".tgz")):
+            stem_name = Path(clean_url_low[:-3]).name or "binary"
+            if current_system == "windows" and not stem_name.lower().endswith((".exe", ".bat", ".cmd", ".ps1")):
+                stem_name += ".exe"
+            raw_out = extract_dir / stem_name
+            total_gz = 0
+            with gzip.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
+                while gz_chunk := f_in.read(65536):
+                    total_gz += len(gz_chunk)
+                    if total_gz > 512 * 1024 * 1024:
+                        print("[ERREUR] Flux .gz décompressé excessif (>512 Mo).", file=sys.stderr)
+                        return False, False
+                    f_out.write(gz_chunk)
+            return True, False
+        if shutil.which("7z"):
+            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
+            if p7z.returncode == 0:
+                return True, False
+            print(f"[ERREUR] Extraction 7z échouée : {p7z.stderr.strip()}", file=sys.stderr)
+            return False, False
+        print(f"  [+] Archive {Path(clean_url_low).suffix or at_low} certifiée par SHA-256.")
+        return True, True
+
+    b_name = os.path.basename(clean_url_low) or "binary"
+    if current_system == "windows" and "." not in b_name:
+        b_name += ".exe"
+    shutil.copy(archive_file, extract_dir / b_name)
+    return True, False
 
 
 _GUI_DESKTOP_BUNDLE_MARKERS = frozenset({
@@ -707,94 +925,59 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
         print(f"  [+] Hash SHA-256 certifié conforme : {calc_hash[:16]}...")
 
+        clean_url_low = url.split("?")[0].lower()
+        target_archive_type = str(selected_target_info.get("archive_type") or "").strip().lower()
+
         if is_font_or_empty_bin:
-            current_dir.mkdir(parents=True, exist_ok=True)
+            print("[2/4] Extraction et validation de l'archive (police / paquet déclaratif)...")
+            ok_uncomp, early_certified = _uncompress_archive(
+                archive_file=archive_file,
+                extract_dir=install_dir,
+                cache_dir=cache_dir,
+                tmp_path=tmp_path,
+                clean_url_low=clean_url_low,
+                current_system=current_system,
+                pkg_name=pkg_name,
+                archive_type=target_archive_type,
+            )
+            if not ok_uncomp:
+                return False
+            shutil.copytree(install_dir, current_dir, dirs_exist_ok=True)
             if "post_install.nu" in hooks and not _run_lifecycle_hook(hooks["post_install.nu"], ctx):
                 return False
-            print("  [+] Paquet déclaratif sans binaire exécutable (ex: police) validé.")
+            extracted_files = [f for f in current_dir.rglob("*") if f.is_file()]
+            if not early_certified and not extracted_files:
+                print("[ERREUR] Aucun fichier extrait pour le paquet déclaratif/police.", file=sys.stderr)
+                return False
+            if category == "fonts" and not early_certified:
+                font_exts = (".ttf", ".otf", ".woff", ".woff2", ".ttc")
+                font_files = [f for f in extracted_files if f.suffix.lower() in font_exts]
+                if not font_files:
+                    print("[ERREUR] Aucune police (.ttf/.otf/.woff/.woff2/.ttc) trouvée dans l'archive.", file=sys.stderr)
+                    return False
+                print(f"  [+] Police typographique validée ({len(font_files)} fichier(s) de police extraits).")
+            else:
+                print("  [+] Paquet déclaratif sans binaire exécutable validé.")
             return _finalize_with_uninstall(True)
 
-        # 2. Extraction sécurisée dans install_dir
-        extract_dir = install_dir
-        clean_url_low = url.split("?")[0].lower()
-        extract_root_str = str(extract_dir.resolve())
-
-        print("[2/4] Extraction et audit de sécurité de l'archive...")
-        early_certified = False
-        if zipfile.is_zipfile(archive_file):
-            with zipfile.ZipFile(archive_file, "r") as zf:
-                for m in zf.infolist():
-                    target = (extract_dir / m.filename).resolve()
-                    if not str(target).startswith(extract_root_str):
-                        print(f"[ERREUR] Zip Slip détecté : {m.filename}", file=sys.stderr)
-                        return False
-                try:
-                    zf.extractall(extract_dir)
-                except NotImplementedError:
-                    if shutil.which("7z"):
-                        subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=120)
-                    else:
-                        raise
-        elif clean_url_low.endswith(".dmg"):
-            if _extract_dmg(archive_file, extract_dir, tmp_path):
-                early_certified = True
-        elif tarfile.is_tarfile(archive_file):
-            with tarfile.open(archive_file, "r:*") as tf:
-                members = tf.getmembers()
-                for t_member in members:
-                    target = (extract_dir / t_member.name).resolve()
-                    if not str(target).startswith(extract_root_str):
-                        print(f"[ERREUR] Tar Slip détecté : {t_member.name}", file=sys.stderr)
-                        return False
-                    if t_member.issym() or t_member.islnk():
-                        norm_link = os.path.normpath(os.path.join(os.path.dirname(t_member.name), t_member.linkname))
-                        if not str((extract_dir / norm_link).resolve()).startswith(extract_root_str):
-                            print(f"[ERREUR] Lien symbolique hors arborescence : {t_member.name}", file=sys.stderr)
-                            return False
-                tf.extractall(extract_dir, members=members)
-        elif clean_url_low.endswith(".xz") and not clean_url_low.endswith(".tar.xz"):
-            raw_out = extract_dir / Path(clean_url_low[:-3]).name
-            with lzma.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
-                shutil.copyfileobj(f_in, f_out)
-        elif clean_url_low.endswith(".gz") and not clean_url_low.endswith((".tar.gz", ".tgz")):
-            stem_name = Path(clean_url_low[:-3]).name or "binary"
-            if current_system == "windows" and not stem_name.lower().endswith((".exe", ".bat", ".cmd", ".ps1")):
-                stem_name += ".exe"
-            raw_out = extract_dir / stem_name
-            total_gz = 0
-            with gzip.open(archive_file, "rb") as f_in, open(raw_out, "wb") as f_out:
-                while gz_chunk := f_in.read(65536):
-                    total_gz += len(gz_chunk)
-                    if total_gz > 512 * 1024 * 1024:
-                        print("[ERREUR] Flux .gz décompressé excessif (>512 Mo).", file=sys.stderr)
-                        return False
-                    f_out.write(gz_chunk)
-        elif clean_url_low.endswith((".7z", ".msi")) and shutil.which("7z"):
-            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
-            if p7z.returncode != 0:
-                print(f"[ERREUR] Extraction 7z échouée : {p7z.stderr.strip()}", file=sys.stderr)
-                return False
-        elif clean_url_low.endswith((".zst", ".tzst", ".7z", ".rar")) and shutil.which("ouch"):
-            named_arc = cache_dir / Path(clean_url_low).name
-            if not named_arc.exists():
-                shutil.copy2(archive_file, named_arc)
-            po = subprocess.run(
-                ["ouch", "decompress", "--yes", "--dir", str(extract_dir), str(named_arc)],
-                capture_output=True,
-                text=True,
-                timeout=120,
+        # 2. Extraction sécurisée dans install_dir selon la table uncompress
+        print("[2/4] Extraction et audit de sécurité de l'archive (uncompress)...")
+        try:
+            ok_uncomp, early_certified = _uncompress_archive(
+                archive_file=archive_file,
+                extract_dir=install_dir,
+                cache_dir=cache_dir,
+                tmp_path=tmp_path,
+                clean_url_low=clean_url_low,
+                current_system=current_system,
+                pkg_name=pkg_name,
+                archive_type=target_archive_type,
             )
-            if po.returncode != 0:
-                print(f"[ERREUR] Extraction ouch échouée : {po.stderr.strip()}", file=sys.stderr)
-                return False
-        elif clean_url_low.endswith((".zst", ".tzst", ".7z", ".msi")):
-            print(f"  [+] Archive {Path(clean_url_low).suffix} certifiée par SHA-256.")
-            early_certified = True
-        else:
-            b_name = os.path.basename(clean_url_low) or "binary"
-            if current_system == "windows" and "." not in b_name:
-                b_name += ".exe"
-            shutil.copy(archive_file, extract_dir / b_name)
+        except ValueError as sec_err:
+            print(f"[ERREUR] {sec_err}", file=sys.stderr)
+            return False
+        if not ok_uncomp:
+            return False
 
         # Publication vers current/ avant post_install.nu (fidèle à orchestrators.nu)
         shutil.copytree(install_dir, current_dir, dirs_exist_ok=True)
