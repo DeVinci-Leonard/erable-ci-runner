@@ -55,7 +55,10 @@ def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
             return True
         except UnicodeDecodeError:
             return False
-    if file_path.suffix.lower() in (".ps1", ".bat", ".cmd", ".sh"):
+    low_suf = file_path.suffix.lower()
+    if expected_os != "windows" and low_suf in (".exe", ".bat", ".cmd", ".ps1", ".msi"):
+        return False
+    if low_suf == ".sh" or (expected_os == "windows" and low_suf in (".ps1", ".bat", ".cmd")):
         return True
     with open(file_path, "rb") as f:
         magic = f.read(512)
@@ -313,7 +316,9 @@ def _uncompress_archive(
 
     archive_exts = (".zip", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".tzst", ".tar", ".zst", ".gz", ".xz", ".rar")
     archive_types = {"zip", "7z", "tar.gz", "tgz", "tar.xz", "tar.zst", "tzst", "tar", "zst", "gz", "xz", "rar"}
-    looks_archive = is_zip or is_tar or clean_url_low.endswith(archive_exts) or at_low in archive_types
+    raw_font_exts = (".ttf", ".otf", ".ttc", ".woff", ".woff2")
+    is_raw_font = (not is_zip) and (not is_tar) and clean_url_low.endswith(raw_font_exts)
+    looks_archive = (not is_raw_font) and (is_zip or is_tar or clean_url_low.endswith(archive_exts) or at_low in archive_types)
 
     if looks_archive:
         ouch_bin = _resolve_ouch_bin()
@@ -491,7 +496,7 @@ _PROBE_ENV_STRIP_KEYS = (
     "DAGGER_CLOUD_TOKEN",
     "DAGGER_CLOUD_ENGINE",
 )
-_SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help"}
+_SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help", "/?", "/h", "/help"}
 
 
 def _promote_latest_jdk(env: Dict[str, str]) -> None:
@@ -549,12 +554,12 @@ def _extract_safe_custom_probe(
     if not cmd_stem or not any(cmd_stem == st or st.startswith(cmd_stem) for st in valid_stems):
         return None
     args = tokens[1:]
-    if not all(arg in _SAFE_CUSTOM_PROBE_ARGS for arg in args):
+    if not all(arg in _SAFE_CUSTOM_PROBE_ARGS or bool(re.fullmatch(r"--[a-z0-9][a-z0-9-]*-(?:version|help)", arg)) for arg in args):
         return None
     first = args[0].lower()
     if first == "version":
         kind = "subcmd_version"
-    elif "help" in first or first == "-h":
+    elif "help" in first or first in ("-h", "/?", "/h", "/help"):
         kind = "help"
     else:
         kind = "version"
@@ -1004,7 +1009,10 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                 continue
             b_leaf = Path(b_src).name.lower()
             b_stem = Path(b_src).stem.lower()
-            cand_names = {b_leaf, b_stem, f"{b_stem}.exe", f"{b_stem}.nu", f"{b_stem}.ps1", f"{b_stem}.bat", f"{b_stem}.cmd"}
+            if current_system == "windows":
+                cand_names = {b_leaf, b_stem, f"{b_stem}.exe", f"{b_stem}.nu", f"{b_stem}.ps1", f"{b_stem}.bat", f"{b_stem}.cmd"}
+            else:
+                cand_names = {b_leaf, b_stem, f"{b_stem}.sh", f"{b_stem}.nu"}
             matched = [
                 f for f in all_files
                 if (f.name.lower() in cand_names or str(f.relative_to(current_dir)).replace("\\", "/").lower().endswith(b_src.lower()))
@@ -1014,6 +1022,8 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                 if current_system == "windows":
                     ext_prio = {".exe": 0, ".nu": 0, ".cmd": 1, ".bat": 2, ".ps1": 3}
                     matched.sort(key=lambda p: (ext_prio.get(p.suffix.lower(), 4), len(p.parts)))
+                else:
+                    matched.sort(key=lambda p: (0 if p.suffix == "" else (1 if p.suffix.lower() in (".sh", ".nu") else 2), len(p.parts)))
                 target_binary = matched[0]
                 break
 
