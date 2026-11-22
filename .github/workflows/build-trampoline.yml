@@ -22,31 +22,37 @@ jobs:
           - os: windows-latest
             name: Windows x86_64
             target_name: windows-x86_64
+            rust_target: x86_64-pc-windows-msvc
             is_windows: true
             ouch_asset: ouch-x86_64-pc-windows-msvc.zip
           - os: windows-11-vs2026-arm
             name: Windows ARM64
             target_name: windows-aarch64
+            rust_target: aarch64-pc-windows-msvc
             is_windows: true
             ouch_asset: ouch-aarch64-pc-windows-msvc.zip
           - os: ubuntu-latest
             name: Linux x86_64
             target_name: linux-x86_64
+            rust_target: x86_64-unknown-linux-musl
             is_linux: true
             ouch_asset: ouch-x86_64-unknown-linux-gnu.tar.gz
           - os: ubuntu-26.04-arm
             name: Linux ARM64
             target_name: linux-aarch64
+            rust_target: aarch64-unknown-linux-musl
             is_linux: true
             ouch_asset: ouch-aarch64-unknown-linux-gnu.tar.gz
           - os: macos-latest
             name: macOS Apple Silicon (ARM64)
             target_name: macos-aarch64
+            rust_target: aarch64-apple-darwin
             is_macos: true
             ouch_asset: ouch-aarch64-apple-darwin.tar.gz
           - os: macos-26-intel
             name: macOS Intel (x86_64)
             target_name: macos-x86_64
+            rust_target: x86_64-apple-darwin
             is_macos: true
             ouch_asset: ouch-x86_64-apple-darwin.tar.gz
 
@@ -56,7 +62,7 @@ jobs:
         run: |
           GIT_REF="${{ github.event.client_payload.ref || inputs.ref || 'main' }}"
           echo "GIT_REF=$GIT_REF" >> "$GITHUB_ENV"
-          echo "Compilation du trampoline sur ${{ matrix.os }} (${{ matrix.target_name }}) pour la référence $GIT_REF"
+          echo "Compilation du trampoline sur ${{ matrix.os }} (${{ matrix.target_name }}, target=${{ matrix.rust_target }}) pour la référence $GIT_REF"
 
       - name: Cloner le dépôt source Érable Core
         shell: bash
@@ -65,38 +71,51 @@ jobs:
 
       - name: Configuration de Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
-      - name: Exécuter les tests unitaires du trampoline
+      - name: Cache Cargo Trampoline
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/tools/trampoline
+
+      - name: Outils musl statiques (Linux)
+        if: matrix.is_linux
+        shell: bash
+        run: |
+          if ! command -v musl-gcc >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          fi
+
+      - name: Tests unitaires et compilation release du trampoline
         shell: bash
         run: |
           cd core/tools/trampoline
-          cargo test --verbose
-
-      - name: Compiler le trampoline natif
-        shell: bash
-        run: |
-          cd core/tools/trampoline
-          cargo build --release
+          cargo test --release --target "${{ matrix.rust_target }}" --verbose -- --test-threads=1
+          cargo build --release --target "${{ matrix.rust_target }}"
           mkdir -p ../../../dist
+          REL_DIR="target/${{ matrix.rust_target }}/release"
           case "${{ matrix.target_name }}" in
             windows-x86_64)
-              cp target/release/trampoline.exe ../../../dist/trampoline.exe
-              cp target/release/trampoline.exe ../../../dist/trampoline-x86_64-windows.exe
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline.exe
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline-x86_64-windows.exe
               ;;
             windows-aarch64)
-              cp target/release/trampoline.exe ../../../dist/trampoline-aarch64-windows.exe
+              cp "${REL_DIR}/trampoline.exe" ../../../dist/trampoline-aarch64-windows.exe
               ;;
             linux-x86_64)
-              cp target/release/trampoline ../../../dist/trampoline-x86_64-linux
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-x86_64-linux
+              file ../../../dist/trampoline-x86_64-linux
               ;;
             linux-aarch64)
-              cp target/release/trampoline ../../../dist/trampoline-aarch64-linux
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-aarch64-linux
+              file ../../../dist/trampoline-aarch64-linux
               ;;
             macos-aarch64)
-              cp target/release/trampoline ../../../dist/trampoline-aarch64-macos
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-aarch64-macos
               ;;
             macos-x86_64)
-              cp target/release/trampoline ../../../dist/trampoline-x86_64-macos
+              cp "${REL_DIR}/trampoline" ../../../dist/trampoline-x86_64-macos
               ;;
           esac
 
