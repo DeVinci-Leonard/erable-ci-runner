@@ -45,16 +45,22 @@ jobs:
       matrix: ${{ fromJson(github.event.client_payload.matrix || inputs.matrix || '{"include":[{"os":"ubuntu-latest","os-name":"linux","arch":"x86_64","target_key":"x86_64-linux"},{"os":"windows-latest","os-name":"windows","arch":"x86_64","target_key":"x86_64-windows"},{"os":"macos-latest","os-name":"macos","arch":"aarch64","target_key":"aarch64-macos"}]}') }}
 
     steps:
-      - name: Récupération du dépôt
+      - name: Récupération du dépôt (runner uniquement)
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          show-progress: false
+          sparse-checkout: runner/validate.py
+          sparse-checkout-cone-mode: false
 
-      - name: Configuration de Python (dernière version stable)
+      - name: Configuration de Python (3.x toolcache)
         id: setup_py
         uses: actions/setup-python@v7
         with:
           python-version: "3.x"
           allow-prereleases: false
-          check-latest: true
+          check-latest: false
 
       - name: Définition de PYTHON_BIN
         shell: bash
@@ -198,107 +204,122 @@ jobs:
           print(f"[+] Hooks préparés: {written_hooks} | needs_nu={needs_nu} | needs_ouch={needs_ouch}")
           PY
 
-      - name: Configuration conditionnelle de Nushell (dernière release)
-        if: steps.prep_manifests.outputs.needs_nu == 'true'
+      - name: Configuration conditionnelle de Nushell et ouch (dernières releases, parallèle)
+        if: steps.prep_manifests.outputs.needs_nu == 'true' || steps.prep_manifests.outputs.needs_ouch == 'true'
         shell: bash
+        env:
+          NEEDS_NU: ${{ steps.prep_manifests.outputs.needs_nu }}
+          NEEDS_OUCH: ${{ steps.prep_manifests.outputs.needs_ouch }}
+          TARGET_PAIR: ${{ matrix.os-name }}-${{ matrix.arch }}
         run: |
-          NU_EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/nushell/nushell/releases/latest)"
-          NU_TAG="${NU_EFFECTIVE_URL##*/}"
-          NU_VER="${NU_TAG#v}"
-          if [ -z "$NU_VER" ] || [ "$NU_VER" = "latest" ]; then
-            echo "::error::Impossible de résoudre la dernière version stable de Nushell"
-            exit 1
-          fi
-          case "${{ matrix.os-name }}-${{ matrix.arch }}" in
-            linux-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-unknown-linux-gnu.tar.gz" ;;
-            linux-aarch64)   NU_ASSET="nu-${NU_VER}-aarch64-unknown-linux-gnu.tar.gz" ;;
-            windows-x86_64)  NU_ASSET="nu-${NU_VER}-x86_64-pc-windows-msvc.zip" ;;
-            windows-aarch64) NU_ASSET="nu-${NU_VER}-aarch64-pc-windows-msvc.zip" ;;
-            macos-aarch64)   NU_ASSET="nu-${NU_VER}-aarch64-apple-darwin.tar.gz" ;;
-            macos-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-apple-darwin.tar.gz" ;;
-            *) echo "::error::Cible Nushell non supportée: ${{ matrix.os-name }}-${{ matrix.arch }}"; exit 1 ;;
-          esac
-          NU_URL="https://github.com/nushell/nushell/releases/download/${NU_TAG}/${NU_ASSET}"
-          NU_DIR="${RUNNER_TEMP}/erable-nu"
-          mkdir -p "$NU_DIR"
-          ARCH_PATH="${RUNNER_TEMP}/${NU_ASSET}"
-          echo "[+] Téléchargement de Nushell ${NU_VER} (${NU_ASSET})..."
-          curl -fSL --retry 3 --retry-delay 2 "$NU_URL" -o "$ARCH_PATH"
-          if [[ "$NU_ASSET" == *.zip ]]; then
-            "$PYTHON_BIN" -m zipfile -e "$ARCH_PATH" "$NU_DIR"
-          else
-            tar -xzf "$ARCH_PATH" -C "$NU_DIR"
-          fi
-          "$PYTHON_BIN" - "$NU_DIR" <<'PY'
-          import os, platform, sys
+          "$PYTHON_BIN" - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor
+          import os
+          import platform
+          import shutil
+          import tarfile
+          import time
+          import urllib.request
+          import zipfile
           from pathlib import Path
-          root = Path(sys.argv[1])
-          target = "nu.exe" if platform.system().lower() == "windows" else "nu"
-          for p in root.rglob(target):
-              if p.is_file():
-                  if platform.system().lower() != "windows":
-                      os.chmod(p, 0o755)
-                  nu_abs = str(p.resolve())
-                  nu_parent = str(p.parent.resolve())
-                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fe:
-                      fe.write(f"NU_BIN={nu_abs}\n")
-                  with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
-                      fp.write(f"{nu_parent}\n")
-                  print(f"[+] Nushell latest installé : {nu_abs}")
-                  sys.exit(0)
-          print("::error::Binaire Nushell introuvable après extraction", file=sys.stderr)
-          sys.exit(1)
-          PY
 
-      - name: Configuration conditionnelle d'ouch (dernière release)
-        if: steps.prep_manifests.outputs.needs_ouch == 'true'
-        shell: bash
-        run: |
-          OUCH_EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/ouch-org/ouch/releases/latest)"
-          OUCH_TAG="${OUCH_EFFECTIVE_URL##*/}"
-          if [ -z "$OUCH_TAG" ] || [ "$OUCH_TAG" = "latest" ]; then
-            echo "::error::Impossible de résoudre la dernière version stable de ouch"
-            exit 1
-          fi
-          case "${{ matrix.os-name }}-${{ matrix.arch }}" in
-            linux-x86_64)    OUCH_ASSET="ouch-x86_64-unknown-linux-gnu.tar.gz" ;;
-            linux-aarch64)   OUCH_ASSET="ouch-aarch64-unknown-linux-gnu.tar.gz" ;;
-            windows-x86_64)  OUCH_ASSET="ouch-x86_64-pc-windows-msvc.zip" ;;
-            windows-aarch64) OUCH_ASSET="ouch-aarch64-pc-windows-msvc.zip" ;;
-            macos-aarch64)   OUCH_ASSET="ouch-aarch64-apple-darwin.tar.gz" ;;
-            macos-x86_64)    OUCH_ASSET="ouch-x86_64-apple-darwin.tar.gz" ;;
-            *) echo "::error::Cible ouch non supportée: ${{ matrix.os-name }}-${{ matrix.arch }}"; exit 1 ;;
-          esac
-          OUCH_URL="https://github.com/ouch-org/ouch/releases/download/${OUCH_TAG}/${OUCH_ASSET}"
-          OUCH_DIR="${RUNNER_TEMP}/erable-ouch"
-          mkdir -p "$OUCH_DIR"
-          ARCH_PATH="${RUNNER_TEMP}/${OUCH_ASSET}"
-          echo "[+] Téléchargement d'ouch ${OUCH_TAG} (${OUCH_ASSET})..."
-          curl -fSL --retry 3 --retry-delay 2 "$OUCH_URL" -o "$ARCH_PATH"
-          if [[ "$OUCH_ASSET" == *.zip ]]; then
-            "$PYTHON_BIN" -m zipfile -e "$ARCH_PATH" "$OUCH_DIR"
-          else
-            tar -xzf "$ARCH_PATH" -C "$OUCH_DIR"
-          fi
-          "$PYTHON_BIN" - "$OUCH_DIR" <<'PY'
-          import os, platform, sys
-          from pathlib import Path
-          root = Path(sys.argv[1])
-          target = "ouch.exe" if platform.system().lower() == "windows" else "ouch"
-          for p in root.rglob(target):
-              if p.is_file():
-                  if platform.system().lower() != "windows":
-                      os.chmod(p, 0o755)
-                  ouch_abs = str(p.resolve())
-                  ouch_parent = str(p.parent.resolve())
-                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fe:
-                      fe.write(f"OUCH_BIN={ouch_abs}\n")
-                  with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
-                      fp.write(f"{ouch_parent}\n")
-                  print(f"[+] ouch latest installé : {ouch_abs}")
-                  sys.exit(0)
-          print("::error::Binaire ouch introuvable après extraction", file=sys.stderr)
-          sys.exit(1)
+          needs_nu = os.environ.get("NEEDS_NU") == "true"
+          needs_ouch = os.environ.get("NEEDS_OUCH") == "true"
+          target_pair = os.environ.get("TARGET_PAIR", "").strip()
+          runner_temp = Path(os.environ.get("RUNNER_TEMP") or ".")
+          is_win = platform.system().lower() == "windows"
+          ua_headers = {"User-Agent": "Erable-CI-Runner/1.0"}
+
+          def _resolve_latest_tag(url: str) -> str:
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers=ua_headers, method="HEAD")
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          tag = resp.geturl().rstrip("/").split("/")[-1]
+                      if tag and tag != "latest":
+                          return tag
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f"Impossible de résoudre le dernier tag pour {url}")
+
+          def _download_with_retry(url: str, dest: Path) -> None:
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers=ua_headers)
+                      with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out_f:
+                          shutil.copyfileobj(resp, out_f, length=65536)
+                      return
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(2 * (attempt + 1))
+
+          def _install_tool(kind: str) -> tuple[str, str, str]:
+              if kind == "nu":
+                  tag = _resolve_latest_tag("https://github.com/nushell/nushell/releases/latest")
+                  ver = tag.lstrip("v")
+                  assets = {
+                      "linux-x86_64": f"nu-{ver}-x86_64-unknown-linux-gnu.tar.gz",
+                      "linux-aarch64": f"nu-{ver}-aarch64-unknown-linux-gnu.tar.gz",
+                      "windows-x86_64": f"nu-{ver}-x86_64-pc-windows-msvc.zip",
+                      "windows-aarch64": f"nu-{ver}-aarch64-pc-windows-msvc.zip",
+                      "macos-aarch64": f"nu-{ver}-aarch64-apple-darwin.tar.gz",
+                      "macos-x86_64": f"nu-{ver}-x86_64-apple-darwin.tar.gz",
+                  }
+                  asset = assets.get(target_pair)
+                  if not asset:
+                      raise RuntimeError(f"Cible Nushell non supportée: {target_pair}")
+                  url = f"https://github.com/nushell/nushell/releases/download/{tag}/{asset}"
+                  out_dir = runner_temp / "erable-nu"
+                  bin_name = "nu.exe" if is_win else "nu"
+                  env_key = "NU_BIN"
+              else:
+                  tag = _resolve_latest_tag("https://github.com/ouch-org/ouch/releases/latest")
+                  assets = {
+                      "linux-x86_64": "ouch-x86_64-unknown-linux-gnu.tar.gz",
+                      "linux-aarch64": "ouch-aarch64-unknown-linux-gnu.tar.gz",
+                      "windows-x86_64": "ouch-x86_64-pc-windows-msvc.zip",
+                      "windows-aarch64": "ouch-aarch64-pc-windows-msvc.zip",
+                      "macos-aarch64": "ouch-aarch64-apple-darwin.tar.gz",
+                      "macos-x86_64": "ouch-x86_64-apple-darwin.tar.gz",
+                  }
+                  asset = assets.get(target_pair)
+                  if not asset:
+                      raise RuntimeError(f"Cible ouch non supportée: {target_pair}")
+                  url = f"https://github.com/ouch-org/ouch/releases/download/{tag}/{asset}"
+                  out_dir = runner_temp / "erable-ouch"
+                  bin_name = "ouch.exe" if is_win else "ouch"
+                  env_key = "OUCH_BIN"
+
+              out_dir.mkdir(parents=True, exist_ok=True)
+              arc_path = runner_temp / asset
+              print(f"[+] Téléchargement de {kind} {tag} ({asset})...")
+              _download_with_retry(url, arc_path)
+              if asset.endswith(".zip"):
+                  with zipfile.ZipFile(arc_path, "r") as zf:
+                      zf.extractall(out_dir)
+              else:
+                  with tarfile.open(arc_path, "r:gz") as tf:
+                      tf.extractall(out_dir)
+              for p in out_dir.rglob(bin_name):
+                  if p.is_file():
+                      if not is_win:
+                          os.chmod(p, 0o755)
+                      resolved = str(p.resolve())
+                      print(f"[+] {kind} {tag} installé : {resolved}")
+                      return env_key, resolved, str(p.parent.resolve())
+              raise RuntimeError(f"Binaire {bin_name} introuvable après extraction de {asset}")
+
+          tasks = [k for k, flag in (("nu", needs_nu), ("ouch", needs_ouch)) if flag]
+          with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+              results = list(pool.map(_install_tool, tasks))
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fe, open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
+              for env_key, bin_abs, bin_parent in results:
+                  fe.write(f"{env_key}={bin_abs}\n")
+                  fp.write(f"{bin_parent}\n")
           PY
 
       - name: Validation du Binaire et du Cycle de Vie
