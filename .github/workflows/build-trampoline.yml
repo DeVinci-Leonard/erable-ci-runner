@@ -91,7 +91,7 @@ jobs:
         shell: bash
         run: |
           cd core/tools/trampoline
-          cargo test --release --target "${{ matrix.rust_target }}" --verbose
+          cargo test --release --target "${{ matrix.rust_target }}" --verbose -- --test-threads=1
           cargo build --release --target "${{ matrix.rust_target }}"
           mkdir -p ../../../dist
           REL_DIR="target/${{ matrix.rust_target }}/release"
