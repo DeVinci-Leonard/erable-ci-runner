@@ -31,6 +31,9 @@ on:
       check_cmd:
         description: "Commande de vérification optionnelle (verification.toml)"
         required: false
+      hooks_json:
+        description: "Scripts de cycle de vie .nu encodés JSON/gzb64 (optionnel)"
+        required: false
 
 jobs:
   validate:
@@ -83,15 +86,23 @@ jobs:
           fi
 
       - name: Préparation des Manifestes
+        id: prep_manifests
         shell: bash
         env:
           EVENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
           INPUT_PKG_NAME: ${{ inputs.package_name }}
+          INPUT_VERSION: ${{ inputs.version }}
           INPUT_TARGETS: ${{ inputs.targets_toml }}
+          INPUT_HOOKS_JSON: ${{ inputs.hooks_json }}
         run: |
           "$PYTHON_BIN" - <<'PY'
-          import json, os
+          import base64
+          import json
+          import os
+          import zlib
           from pathlib import Path
+
+          ALLOWED_HOOKS = ("pre_install.nu", "post_install.nu", "pre_uninstall.nu", "post_uninstall.nu")
 
           payload_str = os.environ.get("EVENT_PAYLOAD") or ""
           payload = {}
@@ -103,11 +114,16 @@ jobs:
               except Exception as e:
                   print("Erreur parsing payload:", e)
 
-          pkg_name = payload.get("package_name") or os.environ.get("INPUT_PKG_NAME") or "jq"
-          print(f"=== Préparation de la recette pour : {pkg_name} ===")
+          pkg_name = str(payload.get("package_name") or os.environ.get("INPUT_PKG_NAME") or "jq").strip()
+          pkg_version = str(payload.get("version") or os.environ.get("INPUT_VERSION") or "latest").strip()
+          print(f"=== Préparation de la recette pour : {pkg_name} v{pkg_version} ===")
 
           parts_dir = Path("package_test/parts")
           parts_dir.mkdir(parents=True, exist_ok=True)
+          (parts_dir / "package.toml").write_text(
+              f"name = {json.dumps(pkg_name)}\nversion = {json.dumps(pkg_version)}\n",
+              encoding="utf-8",
+          )
 
           targets_content = (payload.get("targets_toml") or os.environ.get("INPUT_TARGETS") or "").strip()
 
@@ -137,11 +153,82 @@ jobs:
           with open(parts_dir / "targets.toml", "w", encoding="utf-8") as f:
               f.write(targets_content)
           print("[+] targets.toml écrit avec succès dans", parts_dir)
+
+          written_hooks = []
+          hooks_raw = str(payload.get("hooks_json") or os.environ.get("INPUT_HOOKS_JSON") or "").strip()
+          if hooks_raw:
+              decoded_str = (
+                  zlib.decompress(base64.b64decode(hooks_raw[6:])).decode("utf-8")
+                  if hooks_raw.startswith("gzb64:")
+                  else hooks_raw
+              )
+              hooks_map = json.loads(decoded_str)
+              if isinstance(hooks_map, dict):
+                  for hname in ALLOWED_HOOKS:
+                      hcontent = hooks_map.get(hname)
+                      if isinstance(hcontent, str) and hcontent.strip():
+                          (Path("package_test") / hname).write_text(hcontent, encoding="utf-8")
+                          written_hooks.append(hname)
+
+          needs_nu = bool(written_hooks) or (".nu" in targets_content.lower())
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a", encoding="utf-8") as fh:
+                  fh.write(f"needs_nu={'true' if needs_nu else 'false'}\n")
+          print(f"[+] Hooks préparés: {written_hooks} | needs_nu={needs_nu}")
+          PY
+
+      - name: Configuration conditionnelle de Nushell
+        if: steps.prep_manifests.outputs.needs_nu == 'true'
+        shell: bash
+        run: |
+          NU_VER="0.117.0"
+          case "${{ matrix.os-name }}-${{ matrix.arch }}" in
+            linux-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-unknown-linux-gnu.tar.gz" ;;
+            linux-aarch64)   NU_ASSET="nu-${NU_VER}-aarch64-unknown-linux-gnu.tar.gz" ;;
+            windows-x86_64)  NU_ASSET="nu-${NU_VER}-x86_64-pc-windows-msvc.zip" ;;
+            windows-aarch64) NU_ASSET="nu-${NU_VER}-aarch64-pc-windows-msvc.zip" ;;
+            macos-aarch64)   NU_ASSET="nu-${NU_VER}-aarch64-apple-darwin.tar.gz" ;;
+            macos-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-apple-darwin.tar.gz" ;;
+            *) echo "::error::Cible Nushell non supportée: ${{ matrix.os-name }}-${{ matrix.arch }}"; exit 1 ;;
+          esac
+          NU_URL="https://github.com/nushell/nushell/releases/download/${NU_VER}/${NU_ASSET}"
+          NU_DIR="${RUNNER_TEMP}/erable-nu"
+          mkdir -p "$NU_DIR"
+          ARCH_PATH="${RUNNER_TEMP}/${NU_ASSET}"
+          echo "[+] Téléchargement de Nushell ${NU_VER} (${NU_ASSET})..."
+          curl -fSL --retry 3 --retry-delay 2 "$NU_URL" -o "$ARCH_PATH"
+          if [[ "$NU_ASSET" == *.zip ]]; then
+            "$PYTHON_BIN" -m zipfile -e "$ARCH_PATH" "$NU_DIR"
+          else
+            tar -xzf "$ARCH_PATH" -C "$NU_DIR"
+          fi
+          "$PYTHON_BIN" - "$NU_DIR" <<'PY'
+          import os, platform, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          target = "nu.exe" if platform.system().lower() == "windows" else "nu"
+          for p in root.rglob(target):
+              if p.is_file():
+                  if platform.system().lower() != "windows":
+                      os.chmod(p, 0o755)
+                  nu_abs = str(p.resolve())
+                  nu_parent = str(p.parent.resolve())
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fe:
+                      fe.write(f"NU_BIN={nu_abs}\n")
+                  with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
+                      fp.write(f"{nu_parent}\n")
+                  print(f"[+] Nushell installé : {nu_abs}")
+                  sys.exit(0)
+          print("::error::Binaire Nushell introuvable après extraction", file=sys.stderr)
+          sys.exit(1)
           PY
 
       - name: Validation du Binaire et du Cycle de Vie
         shell: bash
         env:
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}
+          PACKAGE_VERSION: ${{ github.event.client_payload.version || inputs.version || 'latest' }}
           PACKAGE_CATEGORY: ${{ github.event.client_payload.category || inputs.category || 'cli' }}
           TARGET_KEY: ${{ matrix.target_key || '' }}
           CHECK_CMD: ${{ github.event.client_payload.check_cmd || inputs.check_cmd || '' }}
