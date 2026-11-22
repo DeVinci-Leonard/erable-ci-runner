@@ -1,6 +1,6 @@
 name: Validation Multiplateforme Matériel Érable
 
-run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}-${{ github.event.client_payload.correlation_id || inputs.correlation_id || github.run_number }}"
+run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'ouch' }}-${{ github.event.client_payload.correlation_id || inputs.correlation_id || github.run_number }}"
 
 on:
   repository_dispatch:
@@ -10,7 +10,7 @@ on:
       package_name:
         description: "Nom du paquet"
         required: true
-        default: "jq"
+        default: "ouch"
       version:
         description: "Version du paquet"
         required: false
@@ -48,41 +48,30 @@ jobs:
       - name: Récupération du dépôt
         uses: actions/checkout@v7
 
-      - name: Détection de Python >= 3.11
-        id: detect_py
-        shell: bash
-        run: |
-          PY_FOUND=""
-          for cand in python3 python /c/hostedtoolcache/windows/Python/*/*/python.exe /d/hostedtoolcache/windows/Python/*/*/python.exe "/c/Program Files"/Python3*/python.exe; do
-            if [ -x "$cand" ] || command -v "$cand" >/dev/null 2>&1; then
-              if "$cand" -c 'import sys, tomllib; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
-                PY_FOUND="$cand"
-                break
-              fi
-            fi
-          done
-          if [ -n "$PY_FOUND" ]; then
-            echo "has_py=true" >> "$GITHUB_OUTPUT"
-            echo "PYTHON_BIN=$PY_FOUND" >> "$GITHUB_ENV"
-            echo "[+] Python >= 3.11 détecté nativement : $PY_FOUND ($("$PY_FOUND" --version))"
-          else
-            echo "has_py=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Configuration de Python 3.12 (repli si absent)
-        if: steps.detect_py.outputs.has_py != 'true'
+      - name: Configuration de Python (dernière version stable)
+        id: setup_py
         uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.x"
+          allow-prereleases: false
+          check-latest: true
 
-      - name: Définition du binaire Python de repli
-        if: steps.detect_py.outputs.has_py != 'true'
+      - name: Définition de PYTHON_BIN
         shell: bash
+        env:
+          SETUP_PY_PATH: ${{ steps.setup_py.outputs.python-path }}
         run: |
-          if python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
-            echo "PYTHON_BIN=python3" >> "$GITHUB_ENV"
+          if [ -n "$SETUP_PY_PATH" ] && [ -x "$SETUP_PY_PATH" ]; then
+            echo "PYTHON_BIN=$SETUP_PY_PATH" >> "$GITHUB_ENV"
+            echo "[+] Python latest configuré : $SETUP_PY_PATH ($("$SETUP_PY_PATH" --version))"
+          elif command -v python3 >/dev/null 2>&1; then
+            PY_RESOLVED="$(command -v python3)"
+            echo "PYTHON_BIN=$PY_RESOLVED" >> "$GITHUB_ENV"
+            echo "[+] Python détecté : $PY_RESOLVED ($("$PY_RESOLVED" --version))"
           else
-            echo "PYTHON_BIN=python" >> "$GITHUB_ENV"
+            PY_RESOLVED="$(command -v python)"
+            echo "PYTHON_BIN=$PY_RESOLVED" >> "$GITHUB_ENV"
+            echo "[+] Python détecté : $PY_RESOLVED ($("$PY_RESOLVED" --version))"
           fi
 
       - name: Préparation des Manifestes
@@ -94,15 +83,20 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_TARGETS: ${{ inputs.targets_toml }}
           INPUT_HOOKS_JSON: ${{ inputs.hooks_json }}
+          RUNNER_OS_NAME: ${{ matrix.os-name }}
+          TARGET_KEY: ${{ matrix.target_key }}
         run: |
           "$PYTHON_BIN" - <<'PY'
           import base64
           import json
           import os
+          import tomllib
           import zlib
           from pathlib import Path
 
           ALLOWED_HOOKS = ("pre_install.nu", "post_install.nu", "pre_uninstall.nu", "post_uninstall.nu")
+          OUCH_ARCHIVE_EXTS = (".zip", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".tar.zst", ".tzst", ".tar", ".zst", ".gz", ".xz", ".rar")
+          OUCH_ARCHIVE_TYPES = {"zip", "7z", "tar.gz", "tgz", "tar.xz", "tar.zst", "tzst", "tar", "zst", "gz", "xz", "rar"}
 
           payload_str = os.environ.get("EVENT_PAYLOAD") or ""
           payload = {}
@@ -114,7 +108,7 @@ jobs:
               except Exception as e:
                   print("Erreur parsing payload:", e)
 
-          pkg_name = str(payload.get("package_name") or os.environ.get("INPUT_PKG_NAME") or "jq").strip()
+          pkg_name = str(payload.get("package_name") or os.environ.get("INPUT_PKG_NAME") or "ouch").strip()
           pkg_version = str(payload.get("version") or os.environ.get("INPUT_VERSION") or "latest").strip()
           print(f"=== Préparation de la recette pour : {pkg_name} v{pkg_version} ===")
 
@@ -128,26 +122,27 @@ jobs:
           targets_content = (payload.get("targets_toml") or os.environ.get("INPUT_TARGETS") or "").strip()
 
           if not targets_content:
-              print("Utilisation de la recette officielle jq 1.7.1...")
+              print("Utilisation de la recette de démonstration ouch 0.8.3...")
               targets_content = """[targets.x86_64-windows]
-          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-windows-amd64.exe"
-          sha256 = "7451fbbf37feffb9bf262bd97c54f0da558c63f0748e64152dd87b0a07b6d6ab"
-          binaries = [ { source = "jq-windows-amd64.exe", alias = "jq" } ]
+          url = "https://github.com/ouch-org/ouch/releases/download/0.8.3/ouch-x86_64-pc-windows-msvc.zip"
+          sha256 = "6383a95987894412d5c9c4172e3d1d87c86aa322acb2b7ffcad42f492abc5dfe"
+          archive_type = "zip"
+          extract_dir = "ouch-x86_64-pc-windows-msvc"
+          binaries = [ { source = "ouch.exe", alias = "ouch" } ]
 
           [targets.x86_64-linux]
-          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64"
-          sha256 = "5942c9b0934e510ee61eb3e30273f1b3fe2590df3933a93d7c58b81d19c8ff5"
-          binaries = [ { source = "jq-linux-amd64", alias = "jq" } ]
+          url = "https://github.com/ouch-org/ouch/releases/download/0.8.3/ouch-x86_64-unknown-linux-gnu.tar.gz"
+          sha256 = "f0664cbb3bf8c5c781637da2c8bb86b4561a8709f7e10ddb1188150e68e619a7"
+          archive_type = "tar.gz"
+          extract_dir = "ouch-x86_64-unknown-linux-gnu"
+          binaries = [ { source = "ouch", alias = "ouch" } ]
 
           [targets.aarch64-macos]
-          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64"
-          sha256 = "0bbe619e663e0de2c550be2fe0d240d076799d6f8a652b70fa04aea8a8362e8a"
-          binaries = [ { source = "jq-macos-arm64", alias = "jq" } ]
-
-          [targets.x86_64-macos]
-          url = "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-amd64"
-          sha256 = "4155822bbf5ea90f5c79cf254665975eb4274d426d0709770c21774de5407443"
-          binaries = [ { source = "jq-macos-amd64", alias = "jq" } ]
+          url = "https://github.com/ouch-org/ouch/releases/download/0.8.3/ouch-aarch64-apple-darwin.tar.gz"
+          sha256 = "969c1bd9105b5033cc9cac0a37c011d23482948d681b43f97c6f79311f3263d0"
+          archive_type = "tar.gz"
+          extract_dir = "ouch-aarch64-apple-darwin"
+          binaries = [ { source = "ouch", alias = "ouch" } ]
           """
 
           with open(parts_dir / "targets.toml", "w", encoding="utf-8") as f:
@@ -171,18 +166,49 @@ jobs:
                           written_hooks.append(hname)
 
           needs_nu = bool(written_hooks) or (".nu" in targets_content.lower())
+
+          needs_ouch = False
+          if pkg_name.lower() != "ouch":
+              runner_os = os.environ.get("RUNNER_OS_NAME", "").strip().lower()
+              target_key = os.environ.get("TARGET_KEY", "").strip()
+              try:
+                  parsed_targets = tomllib.loads(targets_content).get("targets", {})
+              except Exception:
+                  parsed_targets = {}
+              candidate_items = (
+                  [parsed_targets[target_key]]
+                  if target_key and isinstance(parsed_targets.get(target_key), dict)
+                  else [v for v in parsed_targets.values() if isinstance(v, dict)]
+              )
+              for t_info in candidate_items:
+                  u_low = str(t_info.get("url") or "").split("?", 1)[0].strip().lower()
+                  at_low = str(t_info.get("archive_type") or "").strip().lower()
+                  if u_low.endswith(OUCH_ARCHIVE_EXTS) or at_low in OUCH_ARCHIVE_TYPES:
+                      needs_ouch = True
+                      break
+                  if (u_low.endswith(".dmg") or at_low == "dmg") and runner_os != "macos":
+                      needs_ouch = True
+                      break
+
           gh_out = os.environ.get("GITHUB_OUTPUT")
           if gh_out:
               with open(gh_out, "a", encoding="utf-8") as fh:
                   fh.write(f"needs_nu={'true' if needs_nu else 'false'}\n")
-          print(f"[+] Hooks préparés: {written_hooks} | needs_nu={needs_nu}")
+                  fh.write(f"needs_ouch={'true' if needs_ouch else 'false'}\n")
+          print(f"[+] Hooks préparés: {written_hooks} | needs_nu={needs_nu} | needs_ouch={needs_ouch}")
           PY
 
-      - name: Configuration conditionnelle de Nushell
+      - name: Configuration conditionnelle de Nushell (dernière release)
         if: steps.prep_manifests.outputs.needs_nu == 'true'
         shell: bash
         run: |
-          NU_VER="0.117.0"
+          NU_EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/nushell/nushell/releases/latest)"
+          NU_TAG="${NU_EFFECTIVE_URL##*/}"
+          NU_VER="${NU_TAG#v}"
+          if [ -z "$NU_VER" ] || [ "$NU_VER" = "latest" ]; then
+            echo "::error::Impossible de résoudre la dernière version stable de Nushell"
+            exit 1
+          fi
           case "${{ matrix.os-name }}-${{ matrix.arch }}" in
             linux-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-unknown-linux-gnu.tar.gz" ;;
             linux-aarch64)   NU_ASSET="nu-${NU_VER}-aarch64-unknown-linux-gnu.tar.gz" ;;
@@ -192,7 +218,7 @@ jobs:
             macos-x86_64)    NU_ASSET="nu-${NU_VER}-x86_64-apple-darwin.tar.gz" ;;
             *) echo "::error::Cible Nushell non supportée: ${{ matrix.os-name }}-${{ matrix.arch }}"; exit 1 ;;
           esac
-          NU_URL="https://github.com/nushell/nushell/releases/download/${NU_VER}/${NU_ASSET}"
+          NU_URL="https://github.com/nushell/nushell/releases/download/${NU_TAG}/${NU_ASSET}"
           NU_DIR="${RUNNER_TEMP}/erable-nu"
           mkdir -p "$NU_DIR"
           ARCH_PATH="${RUNNER_TEMP}/${NU_ASSET}"
@@ -218,16 +244,67 @@ jobs:
                       fe.write(f"NU_BIN={nu_abs}\n")
                   with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
                       fp.write(f"{nu_parent}\n")
-                  print(f"[+] Nushell installé : {nu_abs}")
+                  print(f"[+] Nushell latest installé : {nu_abs}")
                   sys.exit(0)
           print("::error::Binaire Nushell introuvable après extraction", file=sys.stderr)
+          sys.exit(1)
+          PY
+
+      - name: Configuration conditionnelle d'ouch (dernière release)
+        if: steps.prep_manifests.outputs.needs_ouch == 'true'
+        shell: bash
+        run: |
+          OUCH_EFFECTIVE_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/ouch-org/ouch/releases/latest)"
+          OUCH_TAG="${OUCH_EFFECTIVE_URL##*/}"
+          if [ -z "$OUCH_TAG" ] || [ "$OUCH_TAG" = "latest" ]; then
+            echo "::error::Impossible de résoudre la dernière version stable de ouch"
+            exit 1
+          fi
+          case "${{ matrix.os-name }}-${{ matrix.arch }}" in
+            linux-x86_64)    OUCH_ASSET="ouch-x86_64-unknown-linux-gnu.tar.gz" ;;
+            linux-aarch64)   OUCH_ASSET="ouch-aarch64-unknown-linux-gnu.tar.gz" ;;
+            windows-x86_64)  OUCH_ASSET="ouch-x86_64-pc-windows-msvc.zip" ;;
+            windows-aarch64) OUCH_ASSET="ouch-aarch64-pc-windows-msvc.zip" ;;
+            macos-aarch64)   OUCH_ASSET="ouch-aarch64-apple-darwin.tar.gz" ;;
+            macos-x86_64)    OUCH_ASSET="ouch-x86_64-apple-darwin.tar.gz" ;;
+            *) echo "::error::Cible ouch non supportée: ${{ matrix.os-name }}-${{ matrix.arch }}"; exit 1 ;;
+          esac
+          OUCH_URL="https://github.com/ouch-org/ouch/releases/download/${OUCH_TAG}/${OUCH_ASSET}"
+          OUCH_DIR="${RUNNER_TEMP}/erable-ouch"
+          mkdir -p "$OUCH_DIR"
+          ARCH_PATH="${RUNNER_TEMP}/${OUCH_ASSET}"
+          echo "[+] Téléchargement d'ouch ${OUCH_TAG} (${OUCH_ASSET})..."
+          curl -fSL --retry 3 --retry-delay 2 "$OUCH_URL" -o "$ARCH_PATH"
+          if [[ "$OUCH_ASSET" == *.zip ]]; then
+            "$PYTHON_BIN" -m zipfile -e "$ARCH_PATH" "$OUCH_DIR"
+          else
+            tar -xzf "$ARCH_PATH" -C "$OUCH_DIR"
+          fi
+          "$PYTHON_BIN" - "$OUCH_DIR" <<'PY'
+          import os, platform, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          target = "ouch.exe" if platform.system().lower() == "windows" else "ouch"
+          for p in root.rglob(target):
+              if p.is_file():
+                  if platform.system().lower() != "windows":
+                      os.chmod(p, 0o755)
+                  ouch_abs = str(p.resolve())
+                  ouch_parent = str(p.parent.resolve())
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fe:
+                      fe.write(f"OUCH_BIN={ouch_abs}\n")
+                  with open(os.environ["GITHUB_PATH"], "a", encoding="utf-8") as fp:
+                      fp.write(f"{ouch_parent}\n")
+                  print(f"[+] ouch latest installé : {ouch_abs}")
+                  sys.exit(0)
+          print("::error::Binaire ouch introuvable après extraction", file=sys.stderr)
           sys.exit(1)
           PY
 
       - name: Validation du Binaire et du Cycle de Vie
         shell: bash
         env:
-          PACKAGE_NAME: ${{ github.event.client_payload.package_name || inputs.package_name || 'jq' }}
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name || inputs.package_name || 'ouch' }}
           PACKAGE_VERSION: ${{ github.event.client_payload.version || inputs.version || 'latest' }}
           PACKAGE_CATEGORY: ${{ github.event.client_payload.category || inputs.category || 'cli' }}
           TARGET_KEY: ${{ matrix.target_key || '' }}
