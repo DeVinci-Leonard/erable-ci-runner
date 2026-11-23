@@ -2,6 +2,8 @@ name: Validation Multiplateforme Matériel Érable
 
 run-name: "validate-${{ github.event.client_payload.package_name || inputs.package_name || 'ouch' }}-${{ github.event.client_payload.correlation_id || inputs.correlation_id || github.run_number }}"
 
+permissions: {}
+
 on:
   repository_dispatch:
     types: [validate-package]
@@ -39,6 +41,8 @@ jobs:
   validate:
     name: ${{ matrix.os-name }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -46,7 +50,7 @@ jobs:
 
     steps:
       - name: Récupération du dépôt (runner uniquement)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
           persist-credentials: false
@@ -54,11 +58,11 @@ jobs:
           sparse-checkout: runner/validate.py
           sparse-checkout-cone-mode: false
 
-      - name: Configuration de Python (3.x toolcache)
+      - name: Configuration de Python (3.12 toolcache)
         id: setup_py
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
-          python-version: "3.x"
+          python-version: "3.12"
           allow-prereleases: false
           check-latest: false
 
@@ -69,7 +73,7 @@ jobs:
         run: |
           if [ -n "$SETUP_PY_PATH" ] && [ -x "$SETUP_PY_PATH" ]; then
             echo "PYTHON_BIN=$SETUP_PY_PATH" >> "$GITHUB_ENV"
-            echo "[+] Python latest configuré : $SETUP_PY_PATH ($("$SETUP_PY_PATH" --version))"
+            echo "[+] Python configuré : $SETUP_PY_PATH ($("$SETUP_PY_PATH" --version))"
           elif command -v python3 >/dev/null 2>&1; then
             PY_RESOLVED="$(command -v python3)"
             echo "PYTHON_BIN=$PY_RESOLVED" >> "$GITHUB_ENV"
@@ -204,16 +208,135 @@ jobs:
           print(f"[+] Hooks préparés: {written_hooks} | needs_nu={needs_nu} | needs_ouch={needs_ouch}")
           PY
 
-      - name: Configuration conditionnelle de Nushell et ouch (dernières releases, parallèle)
+      - name: Résolution des dernières versions nu/ouch et SHA-256 officiels
+        id: resolve_tools
         if: steps.prep_manifests.outputs.needs_nu == 'true' || steps.prep_manifests.outputs.needs_ouch == 'true'
         shell: bash
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           NEEDS_NU: ${{ steps.prep_manifests.outputs.needs_nu }}
           NEEDS_OUCH: ${{ steps.prep_manifests.outputs.needs_ouch }}
           TARGET_PAIR: ${{ matrix.os-name }}-${{ matrix.arch }}
         run: |
           "$PYTHON_BIN" - <<'PY'
           from concurrent.futures import ThreadPoolExecutor
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+
+          needs_nu = os.environ.get("NEEDS_NU") == "true"
+          needs_ouch = os.environ.get("NEEDS_OUCH") == "true"
+          target_pair = os.environ.get("TARGET_PAIR", "").strip()
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "Erable-CI-Runner/1.0",
+          }
+          tok = os.environ.get("GITHUB_TOKEN", "").strip()
+          if tok:
+              headers["Authorization"] = f"Bearer {tok}"
+
+          def _fetch_json(url: str) -> dict:
+              for attempt in range(3):
+                  try:
+                      req = urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          return json.loads(resp.read().decode("utf-8"))
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(1.5 * (attempt + 1))
+              return {}
+
+          def _resolve(kind: str) -> dict:
+              if kind == "nu":
+                  rel = _fetch_json("https://api.github.com/repos/nushell/nushell/releases/latest")
+                  tag = rel["tag_name"]
+                  ver = tag.lstrip("v")
+                  assets_map = {
+                      "linux-x86_64": f"nu-{ver}-x86_64-unknown-linux-gnu.tar.gz",
+                      "linux-aarch64": f"nu-{ver}-aarch64-unknown-linux-gnu.tar.gz",
+                      "windows-x86_64": f"nu-{ver}-x86_64-pc-windows-msvc.zip",
+                      "windows-aarch64": f"nu-{ver}-aarch64-pc-windows-msvc.zip",
+                      "macos-aarch64": f"nu-{ver}-aarch64-apple-darwin.tar.gz",
+                      "macos-x86_64": f"nu-{ver}-x86_64-apple-darwin.tar.gz",
+                  }
+              else:
+                  rel = _fetch_json("https://api.github.com/repos/ouch-org/ouch/releases/latest")
+                  tag = rel["tag_name"]
+                  assets_map = {
+                      "linux-x86_64": "ouch-x86_64-unknown-linux-gnu.tar.gz",
+                      "linux-aarch64": "ouch-aarch64-unknown-linux-gnu.tar.gz",
+                      "windows-x86_64": "ouch-x86_64-pc-windows-msvc.zip",
+                      "windows-aarch64": "ouch-aarch64-pc-windows-msvc.zip",
+                      "macos-aarch64": "ouch-aarch64-apple-darwin.tar.gz",
+                      "macos-x86_64": "ouch-x86_64-apple-darwin.tar.gz",
+                  }
+              asset_name = assets_map.get(target_pair)
+              if not asset_name:
+                  raise RuntimeError(f"Cible {kind} non supportée : {target_pair}")
+              target_asset = next((a for a in rel.get("assets", []) if a.get("name") == asset_name), None)
+              if not target_asset:
+                  raise RuntimeError(f"Asset {asset_name} absent de {kind} {tag}")
+              dl_url = target_asset["browser_download_url"]
+              digest = str(target_asset.get("digest") or "").strip().lower()
+              sha256 = digest.removeprefix("sha256:") if digest.startswith("sha256:") else ""
+              if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                  chk_asset = next((a for a in rel.get("assets", []) if a.get("name") == f"{asset_name}.sha256" or "sha256" in a.get("name", "").lower()), None)
+                  if chk_asset:
+                      creq = urllib.request.Request(chk_asset["browser_download_url"], headers={"User-Agent": "Erable-CI-Runner/1.0"})
+                      with urllib.request.urlopen(creq, timeout=20) as cr:
+                          ctext = cr.read().decode("utf-8", errors="replace")
+                      for line in ctext.splitlines():
+                          if asset_name in line or len(ctext.splitlines()) == 1:
+                              m = re.search(r"\b([0-9a-fA-F]{64})\b", line)
+                              if m:
+                                  sha256 = m.group(1).lower()
+                                  break
+              if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+                  raise RuntimeError(f"SHA-256 officiel introuvable pour {kind} {tag}/{asset_name}")
+              return {"kind": kind, "tag": tag, "asset": asset_name, "url": dl_url, "sha256": sha256}
+
+          requested = [k for k, f in (("nu", needs_nu), ("ouch", needs_ouch)) if f]
+          with ThreadPoolExecutor(max_workers=len(requested)) as pool:
+              res = {d["kind"]: d for d in pool.map(_resolve, requested)}
+
+          nu_meta = res.get("nu", {"tag": "none", "asset": "", "url": "", "sha256": ""})
+          ouch_meta = res.get("ouch", {"tag": "none", "asset": "", "url": "", "sha256": ""})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              for prefix, meta in (("nu", nu_meta), ("ouch", ouch_meta)):
+                  for k, v in meta.items():
+                      if k != "kind":
+                          fh.write(f"{prefix}_{k}={v}\n")
+          print(f"[+] Résolu nu={nu_meta['tag']} ouch={ouch_meta['tag']}")
+          PY
+
+      - name: Cache Nushell & ouch (indexé par versions résolues)
+        if: steps.prep_manifests.outputs.needs_nu == 'true' || steps.prep_manifests.outputs.needs_ouch == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/erable-tools
+          key: erable-tools-${{ matrix.os-name }}-${{ matrix.arch }}-nu-${{ steps.resolve_tools.outputs.nu_tag }}-${{ steps.resolve_tools.outputs.nu_sha256 }}-ouch-${{ steps.resolve_tools.outputs.ouch_tag }}-${{ steps.resolve_tools.outputs.ouch_sha256 }}
+
+      - name: Installation / Vérification SHA-256 de Nushell et ouch
+        if: steps.prep_manifests.outputs.needs_nu == 'true' || steps.prep_manifests.outputs.needs_ouch == 'true'
+        shell: bash
+        env:
+          NEEDS_NU: ${{ steps.prep_manifests.outputs.needs_nu }}
+          NU_TAG: ${{ steps.resolve_tools.outputs.nu_tag }}
+          NU_ASSET: ${{ steps.resolve_tools.outputs.nu_asset }}
+          NU_URL: ${{ steps.resolve_tools.outputs.nu_url }}
+          NU_SHA256: ${{ steps.resolve_tools.outputs.nu_sha256 }}
+          NEEDS_OUCH: ${{ steps.prep_manifests.outputs.needs_ouch }}
+          OUCH_TAG: ${{ steps.resolve_tools.outputs.ouch_tag }}
+          OUCH_ASSET: ${{ steps.resolve_tools.outputs.ouch_asset }}
+          OUCH_URL: ${{ steps.resolve_tools.outputs.ouch_url }}
+          OUCH_SHA256: ${{ steps.resolve_tools.outputs.ouch_sha256 }}
+        run: |
+          "$PYTHON_BIN" - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor
+          import hashlib
           import os
           import platform
           import shutil
@@ -223,96 +346,90 @@ jobs:
           import zipfile
           from pathlib import Path
 
-          needs_nu = os.environ.get("NEEDS_NU") == "true"
-          needs_ouch = os.environ.get("NEEDS_OUCH") == "true"
-          target_pair = os.environ.get("TARGET_PAIR", "").strip()
           runner_temp = Path(os.environ.get("RUNNER_TEMP") or ".")
+          tools_root = runner_temp / "erable-tools"
+          tools_root.mkdir(parents=True, exist_ok=True)
           is_win = platform.system().lower() == "windows"
           ua_headers = {"User-Agent": "Erable-CI-Runner/1.0"}
 
-          def _resolve_latest_tag(url: str) -> str:
-              for attempt in range(3):
-                  try:
-                      req = urllib.request.Request(url, headers=ua_headers, method="HEAD")
-                      with urllib.request.urlopen(req, timeout=20) as resp:
-                          tag = resp.geturl().rstrip("/").split("/")[-1]
-                      if tag and tag != "latest":
-                          return tag
-                  except Exception:
-                      if attempt == 2:
-                          raise
-                      time.sleep(1.5 * (attempt + 1))
-              raise RuntimeError(f"Impossible de résoudre le dernier tag pour {url}")
+          def _safe_extract_zip(arc_path: Path, out_dir: Path) -> None:
+              root = out_dir.resolve()
+              with zipfile.ZipFile(arc_path, "r") as zf:
+                  for m in zf.infolist():
+                      if m.is_dir():
+                          continue
+                      parts = [p for p in m.filename.replace("\\", "/").split("/") if p and p != "."]
+                      if not parts or ".." in parts:
+                          continue
+                      dst = root.joinpath(*parts)
+                      if not dst.resolve().is_relative_to(root):
+                          raise ValueError(f"Zip Slip dans {arc_path.name}: {m.filename}")
+                      dst.parent.mkdir(parents=True, exist_ok=True)
+                      with zf.open(m) as fi, open(dst, "wb") as fo:
+                          shutil.copyfileobj(fi, fo, 65536)
 
-          def _download_with_retry(url: str, dest: Path) -> None:
+          def _install_tool(kind: str) -> tuple[str, str, str]:
+              pfx = kind.upper()
+              tag = os.environ[f"{pfx}_TAG"]
+              asset = os.environ[f"{pfx}_ASSET"]
+              url = os.environ[f"{pfx}_URL"]
+              expected_sha = os.environ[f"{pfx}_SHA256"].lower()
+              out_dir = tools_root / f"erable-{kind}"
+              out_dir.mkdir(parents=True, exist_ok=True)
+              bin_name = f"{kind}.exe" if is_win else kind
+              env_key = f"{pfx}_BIN"
+
+              existing = next((p for p in out_dir.rglob(bin_name) if p.is_file()), None)
+              if existing is not None:
+                  if not is_win:
+                      os.chmod(existing, 0o755)
+                  resolved = str(existing.resolve())
+                  print(f"[+] {kind} {tag} restauré depuis le cache : {resolved}")
+                  return env_key, resolved, str(existing.parent.resolve())
+
+              arc_path = runner_temp / asset
               for attempt in range(3):
                   try:
                       req = urllib.request.Request(url, headers=ua_headers)
-                      with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out_f:
-                          shutil.copyfileobj(resp, out_f, length=65536)
-                      return
+                      h = hashlib.sha256()
+                      with urllib.request.urlopen(req, timeout=60) as resp, open(arc_path, "wb") as out_f:
+                          while chunk := resp.read(65536):
+                              h.update(chunk)
+                              out_f.write(chunk)
+                      actual_sha = h.hexdigest().lower()
+                      if actual_sha != expected_sha:
+                          arc_path.unlink(missing_ok=True)
+                          raise RuntimeError(f"SHA-256 mismatch pour {kind} {tag}: attendu={expected_sha}, obtenu={actual_sha}")
+                      break
+                  except RuntimeError:
+                      raise
                   except Exception:
                       if attempt == 2:
                           raise
                       time.sleep(2 * (attempt + 1))
 
-          def _install_tool(kind: str) -> tuple[str, str, str]:
-              if kind == "nu":
-                  tag = _resolve_latest_tag("https://github.com/nushell/nushell/releases/latest")
-                  ver = tag.lstrip("v")
-                  assets = {
-                      "linux-x86_64": f"nu-{ver}-x86_64-unknown-linux-gnu.tar.gz",
-                      "linux-aarch64": f"nu-{ver}-aarch64-unknown-linux-gnu.tar.gz",
-                      "windows-x86_64": f"nu-{ver}-x86_64-pc-windows-msvc.zip",
-                      "windows-aarch64": f"nu-{ver}-aarch64-pc-windows-msvc.zip",
-                      "macos-aarch64": f"nu-{ver}-aarch64-apple-darwin.tar.gz",
-                      "macos-x86_64": f"nu-{ver}-x86_64-apple-darwin.tar.gz",
-                  }
-                  asset = assets.get(target_pair)
-                  if not asset:
-                      raise RuntimeError(f"Cible Nushell non supportée: {target_pair}")
-                  url = f"https://github.com/nushell/nushell/releases/download/{tag}/{asset}"
-                  out_dir = runner_temp / "erable-nu"
-                  bin_name = "nu.exe" if is_win else "nu"
-                  env_key = "NU_BIN"
-              else:
-                  tag = _resolve_latest_tag("https://github.com/ouch-org/ouch/releases/latest")
-                  assets = {
-                      "linux-x86_64": "ouch-x86_64-unknown-linux-gnu.tar.gz",
-                      "linux-aarch64": "ouch-aarch64-unknown-linux-gnu.tar.gz",
-                      "windows-x86_64": "ouch-x86_64-pc-windows-msvc.zip",
-                      "windows-aarch64": "ouch-aarch64-pc-windows-msvc.zip",
-                      "macos-aarch64": "ouch-aarch64-apple-darwin.tar.gz",
-                      "macos-x86_64": "ouch-x86_64-apple-darwin.tar.gz",
-                  }
-                  asset = assets.get(target_pair)
-                  if not asset:
-                      raise RuntimeError(f"Cible ouch non supportée: {target_pair}")
-                  url = f"https://github.com/ouch-org/ouch/releases/download/{tag}/{asset}"
-                  out_dir = runner_temp / "erable-ouch"
-                  bin_name = "ouch.exe" if is_win else "ouch"
-                  env_key = "OUCH_BIN"
+              try:
+                  if asset.endswith(".zip"):
+                      _safe_extract_zip(arc_path, out_dir)
+                  else:
+                      with tarfile.open(arc_path, "r:gz") as tf:
+                          try:
+                              tf.extractall(out_dir, filter="data")
+                          except TypeError:
+                              tf.extractall(out_dir)
+              finally:
+                  arc_path.unlink(missing_ok=True)
 
-              out_dir.mkdir(parents=True, exist_ok=True)
-              arc_path = runner_temp / asset
-              print(f"[+] Téléchargement de {kind} {tag} ({asset})...")
-              _download_with_retry(url, arc_path)
-              if asset.endswith(".zip"):
-                  with zipfile.ZipFile(arc_path, "r") as zf:
-                      zf.extractall(out_dir)
-              else:
-                  with tarfile.open(arc_path, "r:gz") as tf:
-                      tf.extractall(out_dir)
-              for p in out_dir.rglob(bin_name):
-                  if p.is_file():
-                      if not is_win:
-                          os.chmod(p, 0o755)
-                      resolved = str(p.resolve())
-                      print(f"[+] {kind} {tag} installé : {resolved}")
-                      return env_key, resolved, str(p.parent.resolve())
-              raise RuntimeError(f"Binaire {bin_name} introuvable après extraction de {asset}")
+              installed = next((p for p in out_dir.rglob(bin_name) if p.is_file()), None)
+              if installed is None:
+                  raise RuntimeError(f"Binaire {bin_name} introuvable après extraction de {asset}")
+              if not is_win:
+                  os.chmod(installed, 0o755)
+              resolved = str(installed.resolve())
+              print(f"[+] {kind} {tag} installé & vérifié SHA-256 : {resolved}")
+              return env_key, resolved, str(installed.parent.resolve())
 
-          tasks = [k for k, flag in (("nu", needs_nu), ("ouch", needs_ouch)) if flag]
+          tasks = [k for k in ("nu", "ouch") if os.environ.get(f"NEEDS_{k.upper()}") == "true"]
           with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
               results = list(pool.map(_install_tool, tasks))
 

@@ -12,6 +12,7 @@ Valide pour l'OS courant :
 from contextlib import contextmanager
 import gzip
 import hashlib
+import ipaddress
 import lzma
 import os
 import platform
@@ -19,6 +20,8 @@ import re
 import shlex
 import shutil
 import signal
+import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -26,6 +29,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -38,6 +42,108 @@ for _stream in (sys.stdout, sys.stderr):
 
 ERABLE_REFERER = "https://gitlab.com/cortexa/native-application-ai/erable"
 ERABLE_USER_AGENT = "Chrome/131.0.6778.86"
+
+DISALLOWED_DOMAINS = frozenset({
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "is.gd", "buff.ly", "ow.ly",
+    "pastebin.com", "hastebin.com", "rentry.co", "ghostbin.com",
+    "transfer.sh", "anonfiles.com", "file.io", "temp.sh", "gofile.io", "mega.nz",
+})
+DISALLOWED_ARTIFACT_EXTENSIONS = (".vsix", ".crx", ".xpi", ".deb", ".rpm", ".apk", ".whl")
+_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_FQDN_RE = re.compile(r"^([a-zA-Z0-9_-]+\.)+[a-zA-Z]{2,}$")
+
+
+def _check_resolved_ips_global(hostname: str, port: int) -> None:
+    """Vérifie que toutes les adresses DNS résolues sont publiquement routables (anti-SSRF/IMDS)."""
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"Résolution DNS impossible pour '{hostname}': {exc}") from exc
+    if not infos:
+        raise ValueError(f"Aucune adresse DNS résolue pour '{hostname}'")
+    for info in infos:
+        sockaddr = info[4]
+        raw_ip = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip_obj = ipaddress.ip_address(raw_ip)
+        except ValueError as exc:
+            raise ValueError(f"Adresse IP invalide résolue pour '{hostname}': {raw_ip!r}") from exc
+        if (
+            not ip_obj.is_global
+            or ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+        ):
+            raise ValueError(
+                f"Accès réseau interdit vers une adresse non publique '{raw_ip}' résolue depuis '{hostname}'."
+            )
+
+
+def validate_url_and_domain(url: str, resolve_dns: bool = True) -> None:
+    """Exige HTTPS strict, FQDN valide, domaine autorisé et IP DNS publiquement routable."""
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"Protocole non sécurisé interdit : '{parsed.scheme}://'. Seul HTTPS est autorisé.")
+    clean_path = parsed.path.split("?", 1)[0].lower()
+    if clean_path.endswith(DISALLOWED_ARTIFACT_EXTENSIONS):
+        raise ValueError(f"Extension d'artefact non autonome interdite : '{parsed.path}'")
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        raise ValueError(f"Nom d'hôte manquant dans l'URL : {url}")
+
+    try:
+        ipaddress.ip_address(hostname.split("%", 1)[0])
+        is_ip_literal = True
+    except ValueError:
+        is_ip_literal = False
+
+    if is_ip_literal or _IPV4_RE.match(hostname) or hostname in ("localhost", "ip6-localhost") or hostname.endswith((".local", ".internal", ".localhost")):
+        raise ValueError(f"Adresses IP directes ou hôtes locaux interdits : '{hostname}'. Un FQDN public est requis.")
+
+    if not _FQDN_RE.match(hostname):
+        raise ValueError(f"Syntaxe de domaine FQDN invalide : '{hostname}'")
+
+    for d in DISALLOWED_DOMAINS:
+        if hostname == d or hostname.endswith("." + d):
+            raise ValueError(f"Nom de domaine à haut risque interdit : '{hostname}'.")
+
+    if resolve_dns:
+        _check_resolved_ips_global(hostname, parsed.port or 443)
+
+
+class StrictRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Valide chaque redirection HTTP avant suivi et supprime Authorization sur hôte tiers."""
+
+    def __init__(self, resolve_dns: bool = True) -> None:
+        super().__init__()
+        self.resolve_dns = resolve_dns
+
+    def redirect_request(self, req: urllib.request.Request, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Optional[urllib.request.Request]:
+        full_new_url = urllib.parse.urljoin(req.full_url, newurl)
+        validate_url_and_domain(full_new_url, resolve_dns=self.resolve_dns)
+        new_req = super().redirect_request(req, fp, code, msg, headers, full_new_url)
+        if new_req is not None:
+            if urllib.parse.urlparse(req.full_url).netloc != urllib.parse.urlparse(full_new_url).netloc:
+                if "Authorization" in new_req.headers:
+                    del new_req.headers["Authorization"]
+        return new_req
+
+
+def build_secure_opener(resolve_dns: bool = True) -> urllib.request.OpenerDirector:
+    """Construit un OpenerDirector urllib équipé du StrictRedirectHandler."""
+    handlers: List[Any] = [StrictRedirectHandler(resolve_dns=resolve_dns)]
+    try:
+        import certifi
+        import ssl
+
+        handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=certifi.where())))
+    except Exception:
+        pass
+    return urllib.request.build_opener(*handlers)
 
 
 def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
@@ -156,28 +262,177 @@ def _resolve_ouch_bin() -> Optional[str]:
     return None
 
 
+_MAX_ARCHIVE_EXTRACT_BYTES = 20 * 1024 * 1024 * 1024
+
+
+def _link_or_copy(src: str, dst: str) -> str:
+    """Crée un hardlink O(1) lorsque possible sur le même volume, avec repli copie."""
+    try:
+        if os.path.exists(dst):
+            os.unlink(dst)
+        os.link(src, dst)
+        return dst
+    except OSError:
+        return shutil.copy2(src, dst)
+
+
+def _normalize_rel_member_parts(raw_name: str, kind: str = "archive") -> Optional[List[str]]:
+    """Valide et décompose un chemin de membre d'archive ; retourne None pour l'entrée racine '.'."""
+    norm_raw = str(raw_name or "").replace("\\", "/")
+    drive, _ = os.path.splitdrive(norm_raw)
+    if drive or norm_raw.startswith("/") or (len(norm_raw) >= 2 and norm_raw[1] == ":" and norm_raw[0].isalpha()):
+        raise ValueError(f"{kind} traversal absolu interdit : {raw_name!r}")
+    parts: List[str] = []
+    for part in norm_raw.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            raise ValueError(f"{kind} traversal '..' interdit : {raw_name!r}")
+        parts.append(part)
+    return parts or None
+
+
+def _audit_extracted_symlinks(extract_dir: Path) -> None:
+    """Vérifie après extraction qu'aucun symlink présent dans extract_dir ne s'échappe hors racine."""
+    extract_root = extract_dir.resolve()
+    for root, dirs, files in os.walk(extract_dir, followlinks=False):
+        for entry_name in (*dirs, *files):
+            entry_path = Path(root) / entry_name
+            if entry_path.is_symlink():
+                raw_link = os.readlink(entry_path)
+                if Path(raw_link).is_absolute():
+                    raise ValueError(f"Symlink absolu interdit après extraction : {entry_path} -> {raw_link}")
+                resolved_target = (entry_path.parent / raw_link).resolve()
+                if not resolved_target.is_relative_to(extract_root):
+                    raise ValueError(f"Évasion par symlink après extraction : {entry_path} -> {raw_link}")
+
+
 def _check_zip_slip(archive_file: Path, extract_dir: Path) -> None:
-    extract_root_str = str(extract_dir.resolve())
+    extract_root = extract_dir.resolve()
+    total_size = 0
     with zipfile.ZipFile(archive_file, "r") as zf:
         for m in zf.infolist():
-            target = (extract_dir / m.filename).resolve()
-            if not str(target).startswith(extract_root_str):
+            parts = _normalize_rel_member_parts(m.filename, kind="Zip Slip")
+            if parts is None:
+                continue
+            target = extract_root.joinpath(*parts).resolve()
+            if not target.is_relative_to(extract_root):
                 raise ValueError(f"Zip Slip détecté : {m.filename}")
+            unix_mode = (m.external_attr >> 16) & 0o170000
+            if stat.S_ISLNK(unix_mode):
+                link_target = zf.read(m).decode("utf-8", errors="replace").strip()
+                if not link_target or link_target.startswith(("/", "\\")) or os.path.splitdrive(link_target)[0]:
+                    raise ValueError(f"Symlink ZIP absolu interdit : {m.filename} -> {link_target}")
+                if not (target.parent / link_target).resolve().is_relative_to(extract_root):
+                    raise ValueError(f"Symlink ZIP hors arborescence : {m.filename} -> {link_target}")
+            total_size += max(0, int(m.file_size))
+            if total_size > _MAX_ARCHIVE_EXTRACT_BYTES:
+                raise ValueError(f"Archive ZIP décompressée excessive (> {_MAX_ARCHIVE_EXTRACT_BYTES} octets).")
+
+
+def _extract_zip_safe(archive_file: Path, extract_dir: Path) -> None:
+    """Extrait une archive ZIP membre-par-membre en ignorant les entrées racine vides/'.' (ex: GoReleaser)."""
+    _check_zip_slip(archive_file, extract_dir)
+    extract_root = extract_dir.resolve()
+    total_written = 0
+    with zipfile.ZipFile(archive_file, "r") as zf:
+        for m in zf.infolist():
+            if m.is_dir():
+                continue
+            parts = _normalize_rel_member_parts(m.filename, kind="Zip Slip")
+            if parts is None:
+                # Entrées GoReleaser/BSD avec filename='.' (métadonnées racine) ignorées sans bloquer
+                continue
+            unix_mode = (m.external_attr >> 16) & 0o170000
+            if stat.S_ISLNK(unix_mode):
+                continue
+            dest = extract_root.joinpath(*parts)
+            resolved_parent = dest.parent.resolve()
+            if not resolved_parent.is_relative_to(extract_root):
+                raise ValueError(f"Zip Slip parent détecté : {m.filename}")
+            resolved_parent.mkdir(parents=True, exist_ok=True)
+            resolved_dest = (resolved_parent / dest.name)
+            if not resolved_dest.is_relative_to(extract_root):
+                raise ValueError(f"Zip Slip cible détecté : {m.filename}")
+            with zf.open(m, "r") as f_in, open(resolved_dest, "wb") as f_out:
+                while chunk := f_in.read(65536):
+                    total_written += len(chunk)
+                    if total_written > _MAX_ARCHIVE_EXTRACT_BYTES:
+                        raise ValueError("Dépassement du quota maximal d'extraction ZIP (20 Go).")
+                    f_out.write(chunk)
+    _audit_extracted_symlinks(extract_root)
 
 
 def _check_tar_slip(archive_file: Path, extract_dir: Path) -> List[tarfile.TarInfo]:
-    extract_root_str = str(extract_dir.resolve())
+    extract_root = extract_dir.resolve()
+    total_size = 0
     with tarfile.open(archive_file, "r:*") as tf:
         members = tf.getmembers()
         for t_member in members:
-            target = (extract_dir / t_member.name).resolve()
-            if not str(target).startswith(extract_root_str):
+            parts = _normalize_rel_member_parts(t_member.name, kind="Tar Slip")
+            if parts is None:
+                continue
+            target = extract_root.joinpath(*parts).resolve()
+            if not target.is_relative_to(extract_root):
                 raise ValueError(f"Tar Slip détecté : {t_member.name}")
-            if t_member.issym() or t_member.islnk():
-                norm_link = os.path.normpath(os.path.join(os.path.dirname(t_member.name), t_member.linkname))
-                if not str((extract_dir / norm_link).resolve()).startswith(extract_root_str):
-                    raise ValueError(f"Lien symbolique hors arborescence : {t_member.name}")
+            if t_member.issym():
+                lnk = str(t_member.linkname or "")
+                if not lnk or lnk.startswith(("/", "\\")) or os.path.splitdrive(lnk)[0]:
+                    raise ValueError(f"Lien symbolique absolu interdit : {t_member.name} -> {lnk}")
+                if not (target.parent / lnk).resolve().is_relative_to(extract_root):
+                    raise ValueError(f"Lien symbolique hors arborescence : {t_member.name} -> {lnk}")
+            elif t_member.islnk():
+                lnk = str(t_member.linkname or "")
+                link_parts = _normalize_rel_member_parts(lnk, kind="Tar hardlink")
+                if link_parts is not None:
+                    hard_target = extract_root.joinpath(*link_parts).resolve()
+                    if not hard_target.is_relative_to(extract_root):
+                        raise ValueError(f"Hardlink hors arborescence : {t_member.name} -> {lnk}")
+            total_size += max(0, int(getattr(t_member, "size", 0) or 0))
+            if total_size > _MAX_ARCHIVE_EXTRACT_BYTES:
+                raise ValueError("Archive TAR décompressée excessive (> 20 Go).")
     return members
+
+
+def _precheck_external_archive(archive_file: Path, extract_dir: Path, ouch_bin: Optional[str] = None) -> None:
+    """Inspecte les listes 7z/ouch avant décompression pour rejeter toute traversée '..' ou chemin absolu."""
+    extract_root = extract_dir.resolve()
+    seven_z = shutil.which("7z") or shutil.which("7zz")
+    if seven_z:
+        p = subprocess.run([seven_z, "l", "-slt", str(archive_file)], capture_output=True, text=True, timeout=60)
+        if p.returncode == 0:
+            for line in p.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Path = "):
+                    raw_path = stripped[7:].strip()
+                    if not raw_path or raw_path == str(archive_file):
+                        continue
+                    parts = _normalize_rel_member_parts(raw_path, kind="Archive 7z")
+                    if parts is not None and not extract_root.joinpath(*parts).resolve().is_relative_to(extract_root):
+                        raise ValueError(f"Traversée 7z détectée : {raw_path}")
+                elif stripped.startswith("Symbolic Link = "):
+                    sym_target = stripped[len("Symbolic Link = ") :].strip()
+                    if sym_target and (sym_target.startswith(("/", "\\")) or ".." in sym_target.replace("\\", "/").split("/")):
+                        raise ValueError(f"Symlink 7z dangereux interdit : {sym_target}")
+            return
+    if ouch_bin:
+        p_o = subprocess.run([ouch_bin, "list", str(archive_file)], capture_output=True, text=True, timeout=60)
+        if p_o.returncode == 0:
+            arc_abs = str(archive_file.resolve()).replace("\\", "/")
+            arc_raw = str(archive_file).replace("\\", "/")
+            for line in p_o.stdout.splitlines():
+                cleaned = re.sub(r"^[│├└─\s]+", "", line).strip()
+                norm = cleaned.replace("\\", "/")
+                if (
+                    not cleaned
+                    or cleaned.startswith("[")
+                    or cleaned.lower().startswith("archive:")
+                    or cleaned.endswith(":")
+                    or norm.rstrip(":") in (arc_abs, arc_raw)
+                ):
+                    continue
+                if norm.startswith("/") or os.path.splitdrive(norm)[0] or ".." in norm.split("/"):
+                    raise ValueError(f"Traversée ouch list détectée : {cleaned}")
 
 
 def _resolve_named_archive_path(
@@ -186,13 +441,13 @@ def _resolve_named_archive_path(
     clean_url_low: str,
     archive_type: str,
 ) -> Path:
-    """Donne un nom avec extension reconnue par ouch dans cache_dir."""
+    """Donne un nom avec extension reconnue par ouch dans cache_dir via hardlink O(1)."""
     base_name = Path(clean_url_low).name or "archive"
     if "." not in base_name and archive_type and archive_type != "raw":
         base_name = f"{base_name}.{archive_type.lstrip('.')}"
     named_arc = cache_dir / base_name
     if archive_file.resolve() != named_arc.resolve() and not named_arc.exists():
-        shutil.copy2(archive_file, named_arc)
+        _link_or_copy(str(archive_file), str(named_arc))
     return named_arc
 
 
@@ -322,6 +577,8 @@ def _uncompress_archive(
 
     if looks_archive:
         ouch_bin = _resolve_ouch_bin()
+        if not is_zip and not is_tar:
+            _precheck_external_archive(archive_file, extract_dir, ouch_bin=ouch_bin)
         if ouch_bin and pkg_name.lower() != "ouch":
             named_arc = _resolve_named_archive_path(archive_file, cache_dir, clean_url_low, at_low)
             p_ouch = subprocess.run(
@@ -331,26 +588,32 @@ def _uncompress_archive(
                 timeout=120,
             )
             if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
+                _audit_extracted_symlinks(extract_dir)
                 if current_system == "windows":
                     _normalize_win_single_binary(extract_dir, Path(clean_url_low).stem or pkg_name)
                 return True, False
             if p_ouch.returncode != 0:
                 print(f"  [i] Extraction ouch non applicable ({p_ouch.stderr.strip()[:120]}), repli natif...")
 
-        # Repli natif (bootstrap ouch ou format non pris en charge par ouch dans l'environnement)
+        # Repli natif (bootstrap ouch, ZIP GoReleaser '.' ou format non pris en charge par ouch)
         if is_zip:
-            with zipfile.ZipFile(archive_file, "r") as zf:
-                try:
-                    zf.extractall(extract_dir)
+            try:
+                _extract_zip_safe(archive_file, extract_dir)
+                return True, False
+            except NotImplementedError:
+                if shutil.which("7z"):
+                    _precheck_external_archive(archive_file, extract_dir, ouch_bin=None)
+                    subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=120)
+                    _audit_extracted_symlinks(extract_dir)
                     return True, False
-                except NotImplementedError:
-                    if shutil.which("7z"):
-                        subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=120)
-                        return True, False
-                    raise
+                raise
         if is_tar:
             with tarfile.open(archive_file, "r:*") as tf:
-                tf.extractall(extract_dir, members=members)
+                try:
+                    tf.extractall(extract_dir, members=members, filter="data")
+                except TypeError:
+                    tf.extractall(extract_dir, members=members)
+            _audit_extracted_symlinks(extract_dir)
             return True, False
         if clean_url_low.endswith(".xz") and not clean_url_low.endswith(".tar.xz"):
             raw_out = extract_dir / Path(clean_url_low[:-3]).name
@@ -374,8 +637,10 @@ def _uncompress_archive(
                     f_out.write(gz_chunk)
             return True, False
         if shutil.which("7z"):
+            _precheck_external_archive(archive_file, extract_dir, ouch_bin=None)
             p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
             if p7z.returncode == 0:
+                _audit_extracted_symlinks(extract_dir)
                 return True, False
             print(f"[ERREUR] Extraction 7z échouée : {p7z.stderr.strip()}", file=sys.stderr)
             return False, False
@@ -455,7 +720,14 @@ def _nuon_value(val: Any) -> str:
         return f"{{ {inner} }}"
     if isinstance(val, list):
         return "[" + ", ".join(_nuon_value(v) for v in val) + "]"
-    escaped = str(val).replace("\\", "/").replace('"', '\\"')
+    escaped = (
+        str(val)
+        .replace("\\", "/")
+        .replace('"', '\\"')
+        .replace("\r", "")
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+    )
     return f'"{escaped}"'
 
 
@@ -483,27 +755,25 @@ def _build_probe_cmd(direct_bin: str, suffix: str, probe_args: List[str]) -> Lis
     return [direct_bin, *probe_args]
 
 
-_PROBE_ENV_STRIP_KEYS = (
-    "DOCKER_HOST",
-    "CONTAINER_HOST",
-    "KUBECONFIG",
-    "OTEL_EXPORTER_OTLP_ENDPOINT",
-    "OTEL_EXPORTER_OTLP_HEADERS",
-    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
-    "ACTIONS_RUNTIME_TOKEN",
-    "ACTIONS_RESULTS_URL",
-    "ACTIONS_CACHE_URL",
-    "DAGGER_CLOUD_TOKEN",
-    "DAGGER_CLOUD_ENGINE",
-)
+_PROBE_ENV_ALLOWLIST = frozenset({
+    "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "WINDIR",
+    "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "COMMONPROGRAMFILES", "COMMONPROGRAMFILES(X86)",
+    "LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "TMPDIR", "PATHEXT",
+    "OS", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "RUSTUP_HOME", "CARGO_HOME", "DOTNET_ROOT", "HOMEBREW_NO_AUTO_UPDATE",
+})
 _SAFE_CUSTOM_PROBE_ARGS = {"version", "--version", "-version", "-v", "-V", "--help", "-h", "help", "/?", "/h", "/help"}
 
 
-def _promote_latest_jdk(env: Dict[str, str]) -> None:
+def _promote_latest_jdk(env: Dict[str, str], source_env: Optional[Dict[str, str]] = None) -> None:
     """Sélectionne le JDK préinstallé >= 21 adapté à l'architecture hôte (ex. JAVA_HOME_25_X64)."""
+    scan_env = source_env if source_env is not None else env
     arch_tags = ("ARM64", "AARCH64") if ("arm64" in platform.machine().lower() or "aarch64" in platform.machine().lower()) else ("X64", "AMD64")
     best: Optional[Tuple[int, str]] = None
-    for key, val in env.items():
+    for key, val in scan_env.items():
         m = re.match(r"^JAVA_HOME_(\d+)_([A-Z0-9_]+)$", key)
         if m and m.group(2) in arch_tags and val and Path(val).is_dir():
             ver = int(m.group(1))
@@ -517,11 +787,13 @@ def _promote_latest_jdk(env: Dict[str, str]) -> None:
 
 
 def _build_sanitized_probe_env() -> Dict[str, str]:
-    """Assainit l'environnement des sondes CLI pour éviter connexions cloud/daemon ou télémétrie bloquante."""
-    env = dict(os.environ)
-    for key in _PROBE_ENV_STRIP_KEYS:
-        env.pop(key, None)
-    _promote_latest_jdk(env)
+    """Construit un environnement minimaliste par allowlist stricte (zéro secret/GITHUB_*)."""
+    env: Dict[str, str] = {}
+    for key, val in os.environ.items():
+        up = key.upper()
+        if up in _PROBE_ENV_ALLOWLIST or up.startswith("XDG_"):
+            env[key] = val
+    _promote_latest_jdk(env, dict(os.environ))
     env["CI"] = "true"
     env["PYTHONIOENCODING"] = "utf-8"
     env["NO_COLOR"] = "1"
@@ -720,34 +992,36 @@ def _run_lifecycle_hook(hook_path: Path, ctx: Dict[str, Any]) -> bool:
 
     zero_egress_guard = "; ".join(
         f'def "http {verb}" [...rest] {{ error make {{ msg: "Violation Zero-Egress : http {verb} interdit dans un hook" }} }}'
-        for verb in ("get", "post", "put", "delete", "patch", "head")
+        for verb in ("get", "post", "put", "delete", "patch", "head", "options")
     )
-    hook_norm = str(hook_path.resolve()).replace("\\", "/")
+    hook_norm = str(hook_path.resolve()).replace("\\", "/").replace('"', '\\"')
     ctx_nuon = _nuon_value(ctx)
-    nu_script = f"{zero_egress_guard}; source '{hook_norm}'; main {ctx_nuon}"
+    nu_script = f'{zero_egress_guard}; source "{hook_norm}"; main {ctx_nuon}'
 
     hook_env = _build_sanitized_probe_env()
-    hook_env["HTTP_PROXY"] = "http://127.0.0.1:1"
-    hook_env["HTTPS_PROXY"] = "http://127.0.0.1:1"
-    hook_env["ALL_PROXY"] = "http://127.0.0.1:1"
+    for proxy_key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        hook_env[proxy_key] = "http://127.0.0.1:1"
     hook_env["NO_PROXY"] = ""
-    for secret_k in (
-        "GH_TOKEN", "GITHUB_TOKEN", "GH_PAT", "GITLAB_TOKEN", "GITLAB_OIDC_TOKEN",
-        "SSH_AUTH_SOCK", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-    ):
-        hook_env.pop(secret_k, None)
+    hook_env["no_proxy"] = ""
 
     cmd: List[str] = [nu_bin, "--no-config-file", "--no-history", "-c", nu_script]
     cur_sys = platform.system().lower()
     if cur_sys == "darwin" and shutil.which("sandbox-exec"):
         cmd = ["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", *cmd]
     elif cur_sys == "linux" and shutil.which("unshare"):
-        try:
-            chk = subprocess.run(["unshare", "--net", "--", "true"], capture_output=True, timeout=3)
-            if chk.returncode == 0:
-                cmd = ["unshare", "--net", "--", *cmd]
-        except Exception:
-            pass
+        confined_linux = False
+        for unshare_prefix in (["unshare", "--user", "--map-root-user", "--net", "--"], ["unshare", "--net", "--"]):
+            try:
+                chk = subprocess.run([*unshare_prefix, "true"], capture_output=True, timeout=3)
+                if chk.returncode == 0:
+                    cmd = [*unshare_prefix, *cmd]
+                    confined_linux = True
+                    break
+            except Exception:
+                pass
+        if not confined_linux and os.environ.get("CI", "").lower() == "true":
+            print(f"[ERREUR] Confinement réseau unshare --net indisponible en CI pour {hook_path.name}.", file=sys.stderr)
+            return False
 
     print(f"  [hook] Exécution Zero-Egress de {hook_path.name}...")
     try:
@@ -894,23 +1168,33 @@ def run_test_for_current_os(package_dir: Path) -> bool:
 
         archive_file = cache_dir / "downloaded_file"
 
-        # 1. Téléchargement streamé + SHA-256 en passe unique avec retries sur 429/5xx transitoires
+        # 1. Validation URL/DNS anti-SSRF + Téléchargement streamé + SHA-256 en passe unique
         print(f"[1/4] Téléchargement streamé depuis : {url}")
+        try:
+            validate_url_and_domain(url, resolve_dns=True)
+        except ValueError as sec_url_err:
+            print(f"[ERREUR] URL rejetée ({sec_url_err})", file=sys.stderr)
+            return False
+
         is_sf = "sourceforge.net" in url.lower() or "sf.net" in url.lower()
         req_headers = {"User-Agent": "curl/8.4.0" if is_sf else ERABLE_USER_AGENT}
         if not is_sf:
             req_headers["Referer"] = ERABLE_REFERER
+        secure_opener = build_secure_opener(resolve_dns=True)
         calc_hash = ""
         for dl_attempt in range(3):
             req = urllib.request.Request(url, headers=req_headers)
             sha256 = hashlib.sha256()
             try:
-                with urllib.request.urlopen(req, timeout=180) as resp, open(archive_file, "wb") as f_out:
+                with secure_opener.open(req, timeout=180) as resp, open(archive_file, "wb") as f_out:
                     while chunk := resp.read(65536):
                         sha256.update(chunk)
                         f_out.write(chunk)
                 calc_hash = sha256.hexdigest().lower()
                 break
+            except ValueError as redir_sec_err:
+                print(f"[ERREUR] Redirection HTTP bloquée par politique de sécurité ({redir_sec_err})", file=sys.stderr)
+                return False
             except urllib.error.HTTPError as e:
                 if e.code in (429, 500, 502, 503, 504) and dl_attempt < 2:
                     wait_s = 2 if dl_attempt == 0 else 5
@@ -947,7 +1231,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             )
             if not ok_uncomp:
                 return False
-            shutil.copytree(install_dir, current_dir, dirs_exist_ok=True)
+            shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy)
             if "post_install.nu" in hooks and not _run_lifecycle_hook(hooks["post_install.nu"], ctx):
                 return False
             extracted_files = [f for f in current_dir.rglob("*") if f.is_file()]
@@ -985,7 +1269,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
 
         # Publication vers current/ avant post_install.nu (fidèle à orchestrators.nu)
-        shutil.copytree(install_dir, current_dir, dirs_exist_ok=True)
+        shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy)
 
         if "post_install.nu" in hooks:
             if not _run_lifecycle_hook(hooks["post_install.nu"], ctx):
