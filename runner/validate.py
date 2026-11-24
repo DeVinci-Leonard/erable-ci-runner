@@ -10,6 +10,7 @@ Valide pour l'OS courant :
 """
 
 from contextlib import contextmanager
+import getpass
 import gzip
 import hashlib
 import ipaddress
@@ -199,6 +200,30 @@ def verify_binary_magic(file_path: Path, expected_os: str) -> bool:
         )
         return any(magic.startswith(m) for m in mach_magics) or magic.startswith(b"#!")
     return True
+
+
+def verify_windows_pe_arch(file_path: Path, target_key: str) -> Tuple[bool, str]:
+    """Vérifie la cohérence de l'architecture PE COFF Machine avec la cible Windows attendue."""
+    tgt = (target_key or "").lower()
+    if not tgt or file_path.suffix.lower() not in (".exe", ".dll"):
+        return True, ""
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(4096)
+        if len(header) < 0x40 or header[:2] != b"MZ":
+            return True, ""
+        pe_offset = int(struct.unpack_from("<I", header, 0x3C)[0])
+        if pe_offset < 0 or pe_offset + 6 > len(header) or header[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+            return True, ""
+        machine = int(struct.unpack_from("<H", header, pe_offset + 4)[0])
+    except OSError:
+        return True, ""
+
+    if ("x86_64" in tgt or "amd64" in tgt) and machine == 0xAA64:
+        return False, f"Architecture PE invalide pour {target_key} : {file_path.name} est compilé pour ARM64 (0xAA64)."
+    if ("aarch64" in tgt or "arm64" in tgt) and machine == 0x8664:
+        return False, f"Architecture PE invalide pour {target_key} : {file_path.name} est compilé pour x86_64 (0x8664)."
+    return True, ""
 
 
 def is_windows_gui_pe(file_path: Path) -> bool:
@@ -801,6 +826,8 @@ def _build_sanitized_probe_env() -> Dict[str, str]:
     env["COLORFGBG"] = "15;0"
     env["THEME_MODE"] = "dark"
     env["DO_NOT_TRACK"] = "1"
+    env["NO_UPDATE_NOTIFIER"] = "1"
+    env["BALENA_CLI_DISABLE_AUTO_UPDATE"] = "1"
     env["DAGGER_NO_UPDATE_CHECK"] = "1"
     env["DAGGER_NO_NAG"] = "1"
     return env
@@ -983,6 +1010,33 @@ def _build_lifecycle_ctx(
     }
 
 
+def _resolve_linux_unshare_prefix() -> Optional[List[str]]:
+    """Résout un préfixe unshare --net fonctionnel sous Linux (userns ou repli sudo -n non-root)."""
+    if not shutil.which("unshare"):
+        return None
+    candidates: List[List[str]] = [
+        ["unshare", "--user", "--map-root-user", "--net", "--"],
+        ["unshare", "--net", "--"],
+    ]
+    if shutil.which("sudo"):
+        cur_user = (os.environ.get("USER") or "").strip()
+        if not cur_user:
+            try:
+                cur_user = getpass.getuser()
+            except Exception:
+                cur_user = ""
+        if cur_user:
+            candidates.append(["sudo", "-n", "unshare", "--net", "--", "sudo", "-n", "-u", cur_user, "--"])
+    for unshare_prefix in candidates:
+        try:
+            chk = subprocess.run([*unshare_prefix, "true"], capture_output=True, timeout=3)
+            if chk.returncode == 0:
+                return unshare_prefix
+        except Exception:
+            pass
+    return None
+
+
 def _run_lifecycle_hook(hook_path: Path, ctx: Dict[str, Any]) -> bool:
     """Exécute un hook .nu sous confinement Zero-Egress identique au moteur Nushell."""
     nu_bin = _resolve_nu_bin()
@@ -1009,17 +1063,18 @@ def _run_lifecycle_hook(hook_path: Path, ctx: Dict[str, Any]) -> bool:
     if cur_sys == "darwin" and shutil.which("sandbox-exec"):
         cmd = ["sandbox-exec", "-p", "(version 1) (allow default) (deny network*)", *cmd]
     elif cur_sys == "linux" and shutil.which("unshare"):
-        confined_linux = False
-        for unshare_prefix in (["unshare", "--user", "--map-root-user", "--net", "--"], ["unshare", "--net", "--"]):
-            try:
-                chk = subprocess.run([*unshare_prefix, "true"], capture_output=True, timeout=3)
-                if chk.returncode == 0:
-                    cmd = [*unshare_prefix, *cmd]
-                    confined_linux = True
-                    break
-            except Exception:
-                pass
-        if not confined_linux and os.environ.get("CI", "").lower() == "true":
+        unshare_prefix = _resolve_linux_unshare_prefix()
+        if unshare_prefix:
+            if unshare_prefix[0] == "sudo":
+                env_pairs = [
+                    f"{k}={v}"
+                    for k, v in sorted(hook_env.items())
+                    if "=" not in k and "\n" not in v and "\r" not in v
+                ]
+                cmd = [*unshare_prefix, "env", "-i", *env_pairs, *cmd]
+            else:
+                cmd = [*unshare_prefix, *cmd]
+        elif os.environ.get("CI", "").lower() == "true":
             print(f"[ERREUR] Confinement réseau unshare --net indisponible en CI pour {hook_path.name}.", file=sys.stderr)
             return False
 
@@ -1331,6 +1386,11 @@ def run_test_for_current_os(package_dir: Path) -> bool:
         if not verify_binary_magic(target_binary, os_key_pattern):
             print(f"[ERREUR] En-tête binaire invalide pour {os_key_pattern} !", file=sys.stderr)
             return False
+        if current_system == "windows":
+            pe_ok, pe_err = verify_windows_pe_arch(target_binary, str(selected_target_key or ""))
+            if not pe_ok:
+                print(f"[ERREUR] {pe_err}", file=sys.stderr)
+                return False
         print(f"  [+] Signature machine validée avec succès pour {os_key_pattern.upper()}.")
 
         # 4. Applications GUI (catégorie, bundle .app, marqueurs desktop ou PE GUI) ou cross-ISA non émulée
@@ -1380,7 +1440,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             last_err = ""
             probe_ok = False
             for idx, (probe_args, kind) in enumerate(probes):
-                probe_timeout = 25 if idx == 0 else 15
+                probe_timeout = 45 if (idx == 0 and suffix.lower() in (".cmd", ".bat")) else (25 if idx == 0 else 15)
                 cmd = _build_probe_cmd(direct_bin, suffix, probe_args)
                 try:
                     rc, out_txt, err_txt = _run_bounded_command(

@@ -96,11 +96,62 @@ class TestRunnerSecurityAndExtraction(unittest.TestCase):
             self.assertNotIn("INPUT_HOOKS_JSON", clean)
             self.assertNotIn("GH_TOKEN", clean)
             self.assertIn("PATH", clean)
+            self.assertEqual(clean.get("CI"), "true")
+            self.assertEqual(clean.get("NO_UPDATE_NOTIFIER"), "1")
+            self.assertEqual(clean.get("BALENA_CLI_DISABLE_AUTO_UPDATE"), "1")
 
     def test_nuon_value_escapes_newlines_and_quotes(self) -> None:
         out = validate._nuon_value({"msg": 'line1\n"line2"'})
         self.assertNotIn("\n", out)
         self.assertIn('\\n\\"line2\\"', out)
+
+    def test_verify_windows_pe_arch_rejects_mismatch(self) -> None:
+        import struct
+
+        def make_pe(machine: int, name: str) -> Path:
+            buf = bytearray(0x100)
+            buf[:2] = b"MZ"
+            struct.pack_into("<I", buf, 0x3C, 0x80)
+            buf[0x80:0x84] = b"PE\x00\x00"
+            struct.pack_into("<H", buf, 0x84, machine)
+            p = self.tmp / name
+            p.write_bytes(bytes(buf))
+            return p
+
+        arm_exe = make_pe(0xAA64, "arm.exe")
+        x64_exe = make_pe(0x8664, "x64.exe")
+
+        ok_arm_on_x64, err1 = validate.verify_windows_pe_arch(arm_exe, "x86_64-windows")
+        self.assertFalse(ok_arm_on_x64)
+        self.assertIn("ARM64", err1)
+
+        ok_x64_on_arm, err2 = validate.verify_windows_pe_arch(x64_exe, "aarch64-windows")
+        self.assertFalse(ok_x64_on_arm)
+        self.assertIn("x86_64", err2)
+
+        self.assertTrue(validate.verify_windows_pe_arch(arm_exe, "aarch64-windows")[0])
+        self.assertTrue(validate.verify_windows_pe_arch(x64_exe, "x86_64-windows")[0])
+
+    def test_resolve_linux_unshare_prefix_falls_back_to_sudo(self) -> None:
+        class _FakeProc:
+            def __init__(self, rc: int) -> None:
+                self.returncode = rc
+
+        def fake_which(name: str) -> str | None:
+            return f"/usr/bin/{name}" if name in ("unshare", "sudo") else None
+
+        def fake_run(cmd: list[str], **_kw: object) -> _FakeProc:
+            if cmd[0] == "sudo":
+                return _FakeProc(0)
+            return _FakeProc(1)
+
+        with (
+            mock.patch("validate.shutil.which", side_effect=fake_which),
+            mock.patch.dict(os.environ, {"USER": "runner"}, clear=False),
+            mock.patch("validate.subprocess.run", side_effect=fake_run),
+        ):
+            pref = validate._resolve_linux_unshare_prefix()
+        self.assertEqual(pref, ["sudo", "-n", "unshare", "--net", "--", "sudo", "-n", "-u", "runner", "--"])
 
 
 if __name__ == "__main__":
