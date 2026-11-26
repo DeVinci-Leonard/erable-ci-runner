@@ -153,6 +153,23 @@ class TestRunnerSecurityAndExtraction(unittest.TestCase):
             pref = validate._resolve_linux_unshare_prefix()
         self.assertEqual(pref, ["sudo", "-n", "unshare", "--net", "--", "sudo", "-n", "-u", "runner", "--"])
 
+    def test_extract_zip_safe_handles_file_dir_collision_winerror_183(self) -> None:
+        arc = self.tmp / "collision.zip"
+        with zipfile.ZipFile(arc, "w") as zf:
+            # Simule une entrée de dossier sans slash final / collision fichier vs sous-répertoire
+            zi_dir = zipfile.ZipInfo("app")
+            zi_dir.external_attr = 0x10  # Attribut DOS répertoire sans '/'
+            zf.writestr(zi_dir, b"")
+            zf.writestr("sub", b"placeholder")
+            zf.writestr("sub/tool.exe", b"MZ-COLLISION-OK")
+            zf.writestr("app/main.exe", b"MZ-APP-OK")
+
+        validate._extract_zip_safe(arc, self.ext)
+        self.assertTrue((self.ext / "sub" / "tool.exe").is_file())
+        self.assertEqual((self.ext / "sub" / "tool.exe").read_bytes(), b"MZ-COLLISION-OK")
+        self.assertTrue((self.ext / "app" / "main.exe").is_file())
+        self.assertEqual((self.ext / "app" / "main.exe").read_bytes(), b"MZ-APP-OK")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -362,23 +362,32 @@ def _extract_zip_safe(archive_file: Path, extract_dir: Path) -> None:
     total_written = 0
     with zipfile.ZipFile(archive_file, "r") as zf:
         for m in zf.infolist():
-            if m.is_dir():
+            unix_mode = (m.external_attr >> 16) & 0o170000
+            is_dos_dir = bool(m.external_attr & 0x10) and m.file_size == 0
+            if m.is_dir() or stat.S_ISDIR(unix_mode) or is_dos_dir:
                 continue
             parts = _normalize_rel_member_parts(m.filename, kind="Zip Slip")
             if parts is None:
                 # Entrées GoReleaser/BSD avec filename='.' (métadonnées racine) ignorées sans bloquer
                 continue
-            unix_mode = (m.external_attr >> 16) & 0o170000
             if stat.S_ISLNK(unix_mode):
                 continue
             dest = extract_root.joinpath(*parts)
             resolved_parent = dest.parent.resolve()
             if not resolved_parent.is_relative_to(extract_root):
                 raise ValueError(f"Zip Slip parent détecté : {m.filename}")
+            # Protège Windows (WinError 183) contre une collision fichier/répertoire ou de casse NTFS
+            cur_dir = extract_root
+            for seg in parts[:-1]:
+                cur_dir = cur_dir / seg
+                if cur_dir.exists() and not cur_dir.is_dir():
+                    cur_dir.unlink()
             resolved_parent.mkdir(parents=True, exist_ok=True)
             resolved_dest = (resolved_parent / dest.name)
             if not resolved_dest.is_relative_to(extract_root):
                 raise ValueError(f"Zip Slip cible détecté : {m.filename}")
+            if resolved_dest.is_dir():
+                continue
             with zf.open(m, "r") as f_in, open(resolved_dest, "wb") as f_out:
                 while chunk := f_in.read(65536):
                     total_written += len(chunk)
@@ -424,7 +433,7 @@ def _precheck_external_archive(archive_file: Path, extract_dir: Path, ouch_bin: 
     extract_root = extract_dir.resolve()
     seven_z = shutil.which("7z") or shutil.which("7zz")
     if seven_z:
-        p = subprocess.run([seven_z, "l", "-slt", str(archive_file)], capture_output=True, text=True, timeout=60)
+        p = subprocess.run([seven_z, "l", "-slt", str(archive_file)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         if p.returncode == 0:
             for line in p.stdout.splitlines():
                 stripped = line.strip()
@@ -441,7 +450,7 @@ def _precheck_external_archive(archive_file: Path, extract_dir: Path, ouch_bin: 
                         raise ValueError(f"Symlink 7z dangereux interdit : {sym_target}")
             return
     if ouch_bin:
-        p_o = subprocess.run([ouch_bin, "list", str(archive_file)], capture_output=True, text=True, timeout=60)
+        p_o = subprocess.run([ouch_bin, "list", str(archive_file)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         if p_o.returncode == 0:
             arc_abs = str(archive_file.resolve()).replace("\\", "/")
             arc_raw = str(archive_file).replace("\\", "/")
@@ -529,13 +538,15 @@ def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
             [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(archive_file)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
             return False
 
     if shutil.which("7z") and archive_file.stat().st_size < 200 * 1024 * 1024:
-        p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
+        p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
         if p7z.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
             return False
 
@@ -581,12 +592,14 @@ def _uncompress_archive(
                 ["msiexec", "/a", abs_msi, "/qn", f"TARGETDIR={abs_dest}"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
             if p_msi.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
                 return True, False
         if shutil.which("7z"):
-            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
+            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             if p7z.returncode == 0:
                 return True, False
             print(f"[ERREUR] Extraction 7z du MSI échouée : {p7z.stderr.strip()}", file=sys.stderr)
@@ -610,6 +623,8 @@ def _uncompress_archive(
                 [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(named_arc)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=120,
             )
             if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
@@ -663,7 +678,7 @@ def _uncompress_archive(
             return True, False
         if shutil.which("7z"):
             _precheck_external_archive(archive_file, extract_dir, ouch_bin=None)
-            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, timeout=120)
+            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             if p7z.returncode == 0:
                 _audit_extracted_symlinks(extract_dir)
                 return True, False
@@ -1237,6 +1252,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             req_headers["Referer"] = ERABLE_REFERER
         secure_opener = build_secure_opener(resolve_dns=True)
         calc_hash = ""
+        retried_browser_ua = False
         for dl_attempt in range(3):
             req = urllib.request.Request(url, headers=req_headers)
             sha256 = hashlib.sha256()
@@ -1251,6 +1267,15 @@ def run_test_for_current_os(package_dir: Path) -> bool:
                 print(f"[ERREUR] Redirection HTTP bloquée par politique de sécurité ({redir_sec_err})", file=sys.stderr)
                 return False
             except urllib.error.HTTPError as e:
+                if e.code == 403 and not retried_browser_ua and dl_attempt < 2:
+                    retried_browser_ua = True
+                    req_headers = {
+                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                        "Accept": "*/*",
+                    }
+                    print(f"  [!] HTTP 403 sur {url}, nouvelle tentative avec User-Agent navigateur sans Referer...")
+                    time.sleep(1)
+                    continue
                 if e.code in (429, 500, 502, 503, 504) and dl_attempt < 2:
                     wait_s = 2 if dl_attempt == 0 else 5
                     print(f"  [!] HTTP {e.code} transitoire sur {url}, nouvelle tentative dans {wait_s}s...")
