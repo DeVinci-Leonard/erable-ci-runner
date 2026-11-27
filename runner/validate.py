@@ -540,18 +540,39 @@ def _extract_dmg(archive_file: Path, extract_dir: Path, tmp_path: Path) -> bool:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
+            timeout=240,
         )
         if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
             return False
 
     if shutil.which("7z") and archive_file.stat().st_size < 200 * 1024 * 1024:
-        p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+        p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
         if p7z.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
             return False
 
     print("  [+] Archive .dmg certifiée par SHA-256.")
     return True
+
+
+_RAW_EXEC_MAGICS = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xce\xfa\xed\xfe",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+)
+
+
+def _is_raw_executable_magic(file_path: Path) -> bool:
+    """Détecte les binaires ELF ou Mach-O natifs pour éviter toute extraction erronée via 7z/ouch."""
+    try:
+        with open(file_path, "rb") as f:
+            head = f.read(4)
+        return head in _RAW_EXEC_MAGICS
+    except OSError:
+        return False
 
 
 def _uncompress_archive(
@@ -571,6 +592,13 @@ def _uncompress_archive(
     at_low = archive_type.strip().lower()
     is_zip = zipfile.is_zipfile(archive_file)
     is_tar = (not is_zip) and tarfile.is_tarfile(archive_file)
+
+    if (not is_zip) and (not is_tar) and _is_raw_executable_magic(archive_file):
+        b_name = os.path.basename(clean_url_low) or pkg_name or "binary"
+        if current_system == "windows" and "." not in b_name:
+            b_name += ".exe"
+        shutil.copy(archive_file, extract_dir / b_name)
+        return True, False
 
     if is_zip:
         _check_zip_slip(archive_file, extract_dir)
@@ -619,21 +647,24 @@ def _uncompress_archive(
             _precheck_external_archive(archive_file, extract_dir, ouch_bin=ouch_bin)
         if ouch_bin and pkg_name.lower() != "ouch":
             named_arc = _resolve_named_archive_path(archive_file, cache_dir, clean_url_low, at_low)
-            p_ouch = subprocess.run(
-                [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(named_arc)],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=120,
-            )
-            if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
-                _audit_extracted_symlinks(extract_dir)
-                if current_system == "windows":
-                    _normalize_win_single_binary(extract_dir, Path(clean_url_low).stem or pkg_name)
-                return True, False
-            if p_ouch.returncode != 0:
-                print(f"  [i] Extraction ouch non applicable ({p_ouch.stderr.strip()[:120]}), repli natif...")
+            try:
+                p_ouch = subprocess.run(
+                    [ouch_bin, "decompress", "--yes", "--dir", str(extract_dir), str(named_arc)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=240,
+                )
+                if p_ouch.returncode == 0 and any(f.is_file() for f in extract_dir.rglob("*")):
+                    _audit_extracted_symlinks(extract_dir)
+                    if current_system == "windows":
+                        _normalize_win_single_binary(extract_dir, Path(clean_url_low).stem or pkg_name)
+                    return True, False
+                if p_ouch.returncode != 0:
+                    print(f"  [i] Extraction ouch non applicable ({p_ouch.stderr.strip()[:120]}), repli natif...")
+            except subprocess.TimeoutExpired:
+                print("  [i] Extraction ouch expirée après 240s, repli natif/7z...")
 
         # Repli natif (bootstrap ouch, ZIP GoReleaser '.' ou format non pris en charge par ouch)
         if is_zip:
@@ -643,7 +674,7 @@ def _uncompress_archive(
             except NotImplementedError:
                 if shutil.which("7z"):
                     _precheck_external_archive(archive_file, extract_dir, ouch_bin=None)
-                    subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=120)
+                    subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], check=True, capture_output=True, timeout=240)
                     _audit_extracted_symlinks(extract_dir)
                     return True, False
                 raise
@@ -678,7 +709,7 @@ def _uncompress_archive(
             return True, False
         if shutil.which("7z"):
             _precheck_external_archive(archive_file, extract_dir, ouch_bin=None)
-            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+            p7z = subprocess.run(["7z", "x", str(archive_file), f"-o{extract_dir}", "-y"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240)
             if p7z.returncode == 0:
                 _audit_extracted_symlinks(extract_dir)
                 return True, False
@@ -1385,7 +1416,14 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             if matched:
                 if current_system == "windows":
                     ext_prio = {".exe": 0, ".nu": 0, ".cmd": 1, ".bat": 2, ".ps1": 3}
-                    matched.sort(key=lambda p: (ext_prio.get(p.suffix.lower(), 4), len(p.parts)))
+                    pe_target = selected_target_key or os_key_pattern
+                    matched.sort(
+                        key=lambda p: (
+                            0 if verify_windows_pe_arch(p, pe_target)[0] else 1,
+                            ext_prio.get(p.suffix.lower(), 4),
+                            len(p.parts),
+                        )
+                    )
                 else:
                     matched.sort(key=lambda p: (0 if p.suffix == "" else (1 if p.suffix.lower() in (".sh", ".nu") else 2), len(p.parts)))
                 target_binary = matched[0]
