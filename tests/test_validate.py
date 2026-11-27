@@ -170,6 +170,44 @@ class TestRunnerSecurityAndExtraction(unittest.TestCase):
         self.assertTrue((self.ext / "app" / "main.exe").is_file())
         self.assertEqual((self.ext / "app" / "main.exe").read_bytes(), b"MZ-APP-OK")
 
+    def test_uncompress_archive_bypasses_elf_and_macho_even_with_archive_type(self) -> None:
+        raw_elf = self.tmp / "atmos_linux_amd64"
+        raw_elf.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 32)
+        out_dir = self.tmp / "out_elf"
+        out_dir.mkdir()
+        ok, early = validate._uncompress_archive(
+            archive_file=raw_elf,
+            extract_dir=out_dir,
+            cache_dir=self.tmp,
+            tmp_path=self.tmp,
+            clean_url_low="https://example.org/atmos_1.235.0_linux_amd64",
+            current_system="linux",
+            pkg_name="atmos",
+            archive_type="tar.gz",
+        )
+        self.assertTrue(ok and not early)
+        self.assertTrue((out_dir / "atmos_1.235.0_linux_amd64").is_file())
+
+    def test_windows_pe_arch_prefers_matching_arch_in_multiarch_archive(self) -> None:
+        import struct
+
+        def make_pe(machine: int, path: Path) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            buf = bytearray(0x100)
+            buf[:2] = b"MZ"
+            struct.pack_into("<I", buf, 0x3C, 0x80)
+            buf[0x80:0x84] = b"PE\x00\x00"
+            struct.pack_into("<H", buf, 0x84, machine)
+            path.write_bytes(bytes(buf))
+
+        arm_bin = self.ext / "ARM64" / "NanaBox.exe"
+        x64_bin = self.ext / "x64" / "NanaBox.exe"
+        make_pe(0xAA64, arm_bin)
+        make_pe(0x8664, x64_bin)
+        matched = [arm_bin, x64_bin]
+        matched.sort(key=lambda p: (0 if validate.verify_windows_pe_arch(p, "x86_64-windows")[0] else 1, len(p.parts)))
+        self.assertEqual(matched[0], x64_bin)
+
 
 if __name__ == "__main__":
     unittest.main()
