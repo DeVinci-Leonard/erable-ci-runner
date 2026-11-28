@@ -208,6 +208,31 @@ class TestRunnerSecurityAndExtraction(unittest.TestCase):
         matched.sort(key=lambda p: (0 if validate.verify_windows_pe_arch(p, "x86_64-windows")[0] else 1, len(p.parts)))
         self.assertEqual(matched[0], x64_bin)
 
+    def test_link_or_copy_ignores_winerror_123_broken_symlink(self) -> None:
+        src_dir = self.tmp / "src_forgit"
+        dst_dir = self.tmp / "dst_forgit"
+        (src_dir / "bin").mkdir(parents=True)
+        good = src_dir / "bin" / "forgit.nu"
+        bad = src_dir / "bin" / "git-forgit"
+        good.write_text("# ok\n", encoding="utf-8")
+        bad.write_text("broken\n", encoding="utf-8")
+
+        orig_copy2 = shutil.copy2
+
+        def fake_copy2(s: str, d: str, *a: object, **kw: object) -> str:
+            if str(s).endswith("git-forgit"):
+                err = OSError(22, "The filename, directory name, or volume label syntax is incorrect")
+                err.winerror = 123  # type: ignore[attr-defined]
+                raise err
+            return str(orig_copy2(s, d, *a, **kw))
+
+        with (
+            mock.patch("validate.os.link", side_effect=OSError("no hardlink")),
+            mock.patch("validate.shutil.copy2", side_effect=fake_copy2),
+        ):
+            shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True, copy_function=validate._link_or_copy, ignore_dangling_symlinks=True)
+        self.assertTrue((dst_dir / "bin" / "forgit.nu").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
