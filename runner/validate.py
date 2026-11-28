@@ -291,14 +291,21 @@ _MAX_ARCHIVE_EXTRACT_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def _link_or_copy(src: str, dst: str) -> str:
-    """Crée un hardlink O(1) lorsque possible sur le même volume, avec repli copie."""
+    """Crée un hardlink O(1) lorsque possible sur le même volume, avec repli copie (tolère symlinks/chemins invalides Windows)."""
+    if os.path.islink(src) and not os.path.exists(src):
+        return dst
     try:
-        if os.path.exists(dst):
+        if os.path.lexists(dst):
             os.unlink(dst)
         os.link(src, dst)
         return dst
     except OSError:
-        return shutil.copy2(src, dst)
+        try:
+            return shutil.copy2(src, dst)
+        except OSError as copy_err:
+            if getattr(copy_err, "winerror", None) in (123, 1314) or os.path.islink(src) or not os.path.exists(src):
+                return dst
+            raise
 
 
 def _normalize_rel_member_parts(raw_name: str, kind: str = "archive") -> Optional[List[str]]:
@@ -1342,7 +1349,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             )
             if not ok_uncomp:
                 return False
-            shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy)
+            shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy, ignore_dangling_symlinks=True)
             if "post_install.nu" in hooks and not _run_lifecycle_hook(hooks["post_install.nu"], ctx):
                 return False
             extracted_files = [f for f in current_dir.rglob("*") if f.is_file()]
@@ -1380,7 +1387,7 @@ def run_test_for_current_os(package_dir: Path) -> bool:
             return False
 
         # Publication vers current/ avant post_install.nu (fidèle à orchestrators.nu)
-        shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy)
+        shutil.copytree(install_dir, current_dir, dirs_exist_ok=True, copy_function=_link_or_copy, ignore_dangling_symlinks=True)
 
         if "post_install.nu" in hooks:
             if not _run_lifecycle_hook(hooks["post_install.nu"], ctx):
